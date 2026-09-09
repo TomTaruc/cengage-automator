@@ -583,6 +583,44 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
     return false;
   }
 
+  // ─── Verification ────────────────────────────────────────────────────────────
+  async function clickVerify() {
+    const allBtns = [...document.querySelectorAll("button, [role='button'], a")];
+    for (const btn of allBtns) {
+      const text = (btn.innerText || btn.getAttribute("aria-label") || "").trim().toLowerCase();
+      if ((text === "verify" || text === "check work" || text === "verify work") && isVisible(btn) && !btn.disabled) {
+        sendStatus("Clicking Verify...", "info");
+        btn.scrollIntoView({ behavior: "smooth", block: "center" });
+        await delay(300);
+        btn.click();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function checkVerificationPassed() {
+    // Check if there's a visible error message
+    const bodyText = document.body.innerText.toLowerCase();
+    if (bodyText.includes("verification failed") || 
+        bodyText.includes("not complete") || 
+        bodyText.includes("did not pass")) {
+      return false;
+    }
+    
+    // Check checkboxes. Cengage/LOD lists tasks with checkboxes.
+    // If they aren't checked, the verification failed.
+    const checkboxes = [...document.querySelectorAll("input[type='checkbox']")];
+    const visibleCheckboxes = checkboxes.filter(cb => isVisible(cb));
+    if (visibleCheckboxes.length > 0) {
+      // If any visible checkbox is not checked, verification isn't complete
+      const allChecked = visibleCheckboxes.every(cb => cb.checked);
+      if (!allChecked) return false;
+    }
+    
+    return true;
+  }
+
   function isLabComplete() {
     const keywords = [
       "lab complete", "activity complete", "assignment complete",
@@ -684,8 +722,23 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
            if (a.type === 'type_text') return acc + 1000 + currentSpeed * 0.3;
            return acc + 600;
         }, 0);
-        await delay(totalWait + 1000);
+        await delay(totalWait + 2000); // Wait for actions to complete
         if (stopRequested) break;
+        
+        // ── Check for Verify Button ──
+        const clickedVerify = await clickVerify();
+        if (clickedVerify) {
+           sendStatus("Waiting for verification tests to run...", "info");
+           await delay(6000); // LOD takes a few seconds to run scripts
+           
+           const passed = checkVerificationPassed();
+           if (!passed) {
+              sendStatus("Verification FAILED! Automation stopped so you can fix it.", "error");
+              break;
+           }
+           sendStatus("Verification PASSED!", "success");
+        }
+
         await delay(currentSpeed * 0.5);
       }
 
