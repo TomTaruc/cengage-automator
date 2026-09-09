@@ -270,114 +270,41 @@
     return false;
   }
 
-  function sendKeyToVM(key, modifiers = {}) {
-    const canvas = getVMCanvas() || document.activeElement || document.body;
-    const opts = {
-      key, code: key, bubbles: true, cancelable: true,
-      ctrlKey:  modifiers.ctrl  || false,
-      altKey:   modifiers.alt   || false,
-      shiftKey: modifiers.shift || false,
-      metaKey:  modifiers.meta  || false
-    };
-    canvas.dispatchEvent(new KeyboardEvent("keydown",  opts));
-    canvas.dispatchEvent(new KeyboardEvent("keypress", opts));
-    canvas.dispatchEvent(new KeyboardEvent("keyup",    opts));
+  function sendNativeKey(key, modifiers = 0, textStr = "") {
+    return new Promise(resolve => {
+      chrome.runtime.sendMessage({
+        type: "NATIVE_KEY", key, modifiers, text: textStr
+      }, () => resolve());
+    });
   }
 
   function parseShortcut(shortcut) {
     const parts = shortcut.toLowerCase().split("+");
-    const mods = {
-      ctrl:  parts.includes("ctrl")  || parts.includes("control"),
-      alt:   parts.includes("alt"),
-      shift: parts.includes("shift"),
-      meta:  parts.includes("win")   || parts.includes("meta") || parts.includes("super")
-    };
+    // modifiers bitfield: Alt=1, Ctrl=2, Meta=4, Shift=8
+    let mods = 0;
+    if (parts.includes("alt")) mods |= 1;
+    if (parts.includes("ctrl") || parts.includes("control")) mods |= 2;
+    if (parts.includes("meta") || parts.includes("win") || parts.includes("super")) mods |= 4;
+    if (parts.includes("shift")) mods |= 8;
+    
     const reserved = ["ctrl","control","alt","shift","win","meta","super"];
     const key = parts.find(p => !reserved.includes(p)) || parts[parts.length - 1];
     return { key, mods };
   }
 
   // ─── Text Injection ──────────────────────────────────────────────────────────
-  // BUG-05 FIX: Use clipboard API for reliable text injection into the VM.
-  // KeyboardEvents with isTrusted=false are ignored by remote desktop protocols.
-  // Clipboard write + Ctrl+V is the universally reliable approach.
-  async function copyToClipboard(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (_) {
-      // Fallback: use a hidden textarea + execCommand copy
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        ta.style.cssText = "position:fixed;opacity:0;top:0;left:0;";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-        return true;
-      } catch (_) {
-        return false;
-      }
-    }
-  }
-
-  // Primary method: use Cengage's Type Text dialog
-  async function typeTextViaButton(text) {
-    const btn = findFirst(TYPE_TEXT_BTN_SELECTORS);
-    if (!btn || !isVisible(btn)) {
-      sendStatus("Type Text button not found — using clipboard", "warn");
-      return typeTextViaClipboard(text);
-    }
-
-    sendStatus(`Type Text: "${text.slice(0, 50)}"`, "info");
-    btn.click();
-    await delay(900);
-
-    const input = await waitForEl(TYPE_TEXT_INPUT_SELECTORS, 4000);
-    if (!input) {
-      sendStatus("Type Text dialog did not open — using clipboard", "warn");
-      return typeTextViaClipboard(text);
-    }
-
-    // Fill the dialog input
-    input.focus();
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")
-      || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-    const setter = nativeSetter?.set;
-    if (setter) setter.call(input, text);
-    else input.value = text;
-    input.dispatchEvent(new Event("input",  { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-    await delay(300);
-
-    // Click submit / press Enter
-    const submitBtn = findFirst(TYPE_TEXT_SUBMIT_SELECTORS);
-    if (submitBtn && isVisible(submitBtn)) {
-      submitBtn.click();
-    } else {
-      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-      input.dispatchEvent(new KeyboardEvent("keyup",   { key: "Enter", bubbles: true }));
-    }
-    await delay(600);
-    return true;
-  }
-
-  // BUG-05 FIX: Reliable clipboard-based text injection
-  async function typeTextViaClipboard(text) {
-    sendStatus(`Clipboard inject: "${text.slice(0, 50)}"`, "info");
-    const copied = await copyToClipboard(text);
-    if (!copied) {
-      sendStatus("Clipboard copy failed — skipping injection", "error");
-      return false;
-    }
-    // Focus VM then paste
+  async function typeTextNatively(text) {
+    sendStatus(`Native typing: "${text.slice(0, 50)}"`, "info");
     focusVM();
     await delay(300);
-    sendKeyToVM("v", { ctrl: true });
-    await delay(400);
+    for (const char of text) {
+      if (stopRequested) break;
+      await sendNativeKey(char, 0, char);
+      await delay(30); // small delay between keystrokes
+    }
     return true;
   }
+
 
   // ─── AI Integration ─────────────────────────────────────────────────────────
   function askAI(prompt) {
@@ -412,11 +339,13 @@ ${stepText}
 
 Action types available:
 - {"type":"focus_vm"} — focus the VM window before typing
-- {"type":"type_text","value":"text"} — type text into VM (uses clipboard paste). Use for: passwords, commands, form text, usernames
+- {"type":"type_text","value":"text"} — type text into VM (uses native OS keystrokes). Use for: passwords, commands, form text, usernames
 - {"type":"key","value":"Enter"} — single key press. Values: Enter, Tab, Escape, Space, F1-F12, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, Delete, Backspace
 - {"type":"shortcut","value":"ctrl+v"} — keyboard shortcut. Examples: ctrl+c, ctrl+v, ctrl+a, ctrl+shift+esc, alt+tab, alt+f4
 - {"type":"win_run","value":"notepad.exe"} — open Win+R Run dialog and run a command. Use for opening apps.
 - {"type":"wait","value":2000} — wait N milliseconds. Always add after win_run and after app launches.
+
+If you suspect the VM is at the login screen (e.g., instructions say "Sign in as Administrator"), send {"type":"shortcut","value":"ctrl+alt+delete"} before typing the password!
 
 Common mappings:
 - "Windows Defender Firewall with Advanced Security" → win_run "wf.msc"
@@ -481,7 +410,7 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
         break;
 
       case "type_text":
-        await typeTextViaButton(String(action.value || ""));
+        await typeTextNatively(String(action.value || ""));
         await delay(currentSpeed * 0.3);
         break;
 
@@ -489,7 +418,7 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
         sendStatus(`Key: ${action.value}`, "info");
         focusVM();
         await delay(200);
-        sendKeyToVM(String(action.value));
+        await sendNativeKey(String(action.value));
         await delay(currentSpeed * 0.2);
         break;
 
@@ -498,29 +427,26 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
         focusVM();
         await delay(200);
         const { key, mods } = parseShortcut(String(action.value));
-        sendKeyToVM(key, mods);
+        await sendNativeKey(key, mods);
         await delay(currentSpeed * 0.3);
         break;
       }
 
-      // BUG-06 FIX: win_run uses clipboard for the command, not the Type Text button
-      // Avoids the issue of Cengage's Type Text dialog stealing focus from the Run dialog
       case "win_run": {
         const cmd = String(action.value || "");
         sendStatus(`Win+R → ${cmd}`, "info");
         focusVM();
         await delay(300);
-        // Open Run dialog
-        sendKeyToVM("r", { meta: true });
+        
+        // Open Run dialog (Win+R) - Meta = 4
+        await sendNativeKey("r", 4);
         await delay(1500); // Wait for Run dialog to appear
-        // Copy command to clipboard and paste
-        await copyToClipboard(cmd);
-        await delay(200);
-        sendKeyToVM("a", { ctrl: true }); // Select all in Run box
-        await delay(100);
-        sendKeyToVM("v", { ctrl: true }); // Paste
-        await delay(400);
-        sendKeyToVM("Enter");
+        
+        // Type command and press Enter
+        await typeTextNatively(cmd);
+        await delay(300);
+        await sendNativeKey("Enter");
+        
         await delay(action.waitAfter || 3000);
         break;
       }

@@ -33,6 +33,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.tabs.sendMessage(sender.tab.id, msg).catch(() => {});
     return false;
   }
+
+  // ── NATIVE_KEY (Debugger Keystroke Injection) ─────────────────────────────
+  if (msg.type === "NATIVE_KEY" && sender.tab) {
+    ensureDebugger(sender.tab.id, () => {
+      dispatchNativeKey(sender.tab.id, msg.key, msg.modifiers || 0, msg.text || "", () => {
+        sendResponse({ ok: true });
+      });
+    });
+    return true; // Keep channel open for async response
+  }
+
+  if (msg.type === "DETACH_DEBUGGER" && sender.tab) {
+    if (attachedTabs.has(sender.tab.id)) {
+       chrome.debugger.detach({ tabId: sender.tab.id }, () => {
+         attachedTabs.delete(sender.tab.id);
+         sendResponse({ ok: true });
+       });
+       return true;
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
 });
 
 // ─── Gemini API Call ──────────────────────────────────────────────────────────
@@ -75,4 +97,51 @@ async function handleAI(prompt, apiKey) {
   } catch (e) {
     return { error: `Network error: ${e.message}` };
   }
+}
+
+// ─── Debugger API Bridge (Native Keystrokes) ──────────────────────────────────
+const attachedTabs = new Set();
+
+chrome.debugger.onDetach.addListener((source) => {
+  attachedTabs.delete(source.tabId);
+});
+
+function ensureDebugger(tabId, callback) {
+  if (attachedTabs.has(tabId)) return callback();
+  chrome.debugger.attach({ tabId }, "1.3", () => {
+    if (chrome.runtime.lastError) {
+      console.warn("Debugger attach failed:", chrome.runtime.lastError.message);
+      return callback(); // Proceed anyway, it might fail downstream
+    }
+    attachedTabs.add(tabId);
+    callback();
+  });
+}
+
+const KEY_CODES = {
+  "enter": 13, "tab": 9, "escape": 27, "space": 32, "backspace": 8, "delete": 46,
+  "arrowup": 38, "arrowdown": 40, "arrowleft": 37, "arrowright": 39,
+  "home": 36, "end": 35,
+  "a": 65, "b": 66, "c": 67, "d": 68, "e": 69, "f": 70, "g": 71, "h": 72, "i": 73,
+  "j": 74, "k": 75, "l": 76, "m": 77, "n": 78, "o": 79, "p": 80, "q": 81, "r": 82,
+  "s": 83, "t": 84, "u": 85, "v": 86, "w": 87, "x": 88, "y": 89, "z": 90,
+  "0": 48, "1": 49, "2": 50, "3": 51, "4": 52, "5": 53, "6": 54, "7": 55, "8": 56, "9": 57
+};
+
+function dispatchNativeKey(tabId, keyName, modifiers, textStr, callback) {
+  const code = KEY_CODES[keyName.toLowerCase()] || 0;
+  const downParams = { type: "rawKeyDown", windowsVirtualKeyCode: code, key: keyName, modifiers };
+  const upParams = { type: "keyUp", windowsVirtualKeyCode: code, key: keyName, modifiers };
+
+  chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", downParams, () => {
+    if (textStr) {
+      chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", {
+        type: "char", text: textStr, unmodifiedText: textStr, modifiers
+      }, () => {
+        chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", upParams, callback);
+      });
+    } else {
+      chrome.debugger.sendCommand({ tabId }, "Input.dispatchKeyEvent", upParams, callback);
+    }
+  });
 }
