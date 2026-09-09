@@ -10,7 +10,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // ── AI Request (from any content script) ──────────────────────────────────
   if (msg.type === "ASK_AI") {
-    handleAI(msg.prompt, msg.apiKey).then(sendResponse);
+    handleAI(msg.prompt, msg.apiKey, msg.imageBase64).then(sendResponse);
     return true; // keep channel open for async response
   }
 
@@ -32,6 +32,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "VM_ACTION" && sender.tab) {
     chrome.tabs.sendMessage(sender.tab.id, msg).catch(() => {});
     return false;
+  }
+
+  // ── CAPTURE_SCREEN ──────────────────────────────────────────────────────────
+  if (msg.type === "CAPTURE_SCREEN" && sender.tab) {
+    chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: "jpeg", quality: 60 }, (dataUrl) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ error: chrome.runtime.lastError.message });
+      } else {
+        // Strip the "data:image/jpeg;base64," prefix for Gemini
+        const base64 = dataUrl ? dataUrl.split(",")[1] : null;
+        sendResponse({ imageBase64: base64 });
+      }
+    });
+    return true;
   }
 
   // ── NATIVE_KEY (Debugger Keystroke Injection) ─────────────────────────────
@@ -60,14 +74,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ─── Gemini API Call ──────────────────────────────────────────────────────────
 // BUG-02 FIX: Raised maxOutputTokens to 2048 so coding lab solutions are never truncated.
 // BUG-13 FIX: Surface API errors (bad key, quota exceeded) instead of silently returning "".
-async function handleAI(prompt, apiKey) {
+async function handleAI(prompt, apiKey, imageBase64 = null) {
   if (!apiKey) return { error: "No API key provided." };
+  
   try {
+    const parts = [{ text: prompt }];
+    
+    if (imageBase64) {
+      parts.push({
+        inlineData: {
+          mimeType: "image/jpeg",
+          data: imageBase64
+        }
+      });
+    }
+
     const resp = await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts }],
         generationConfig: { temperature: 0.1, maxOutputTokens: 2048 }
       })
     });

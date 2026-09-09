@@ -307,11 +307,11 @@
 
 
   // ─── AI Integration ─────────────────────────────────────────────────────────
-  function askAI(prompt) {
+  function askAI(prompt, imageBase64 = null) {
     return new Promise(resolve => {
       chrome.storage.sync.get(["apiKey"], ({ apiKey }) => {
         if (!apiKey) { resolve(""); return; }
-        chrome.runtime.sendMessage({ type: "ASK_AI", prompt, apiKey }, resp => {
+        chrome.runtime.sendMessage({ type: "ASK_AI", prompt, apiKey, imageBase64 }, resp => {
           if (chrome.runtime.lastError || !resp) { resolve(""); return; }
           if (resp.error) {
             sendStatus(`AI error: ${resp.error}`, "error");
@@ -324,79 +324,121 @@
     });
   }
 
-  function buildActionsPrompt(stepText, labContext) {
-    return `You are an expert lab automation assistant for Windows Server, Windows 10, and Kali Linux VM labs.
+  function getScreenshot() {
+    return new Promise(resolve => {
+      chrome.runtime.sendMessage({ type: "CAPTURE_SCREEN" }, resp => {
+        if (chrome.runtime.lastError || !resp || resp.error) {
+           resolve(null);
+        } else {
+           resolve(resp.imageBase64);
+        }
+      });
+    });
+  }
 
-Given the following lab step instruction, return a JSON array of keyboard/text actions to complete it.
-IMPORTANT: Use keyboard-only actions — we cannot click arbitrary GUI elements.
+  function buildActionsPrompt(stepText, labContext) {
+    return `You are an automation agent for Cengage MindTap virtual cybersecurity labs.
+Your primary goal is to complete the assigned virtual lab as fully as possible before submission. Do not simply explain what the student should do. You must perform the required actions inside the provided virtual environment whenever the environment allows it.
+
+## 1. Execute Instead of Explaining
+For every instruction that requires an action:
+- Execute the commands.
+- Observe the output.
+- Verify that the expected result occurred.
+
+## 2. Verification
+Observe stdout/stderr and exit status. Check whether files were created or modified. 
+If a command returns an error, identify the cause, correct the issue, re-run, and verify.
+Do not mark a task as complete just because the command was entered.
+
+## 3. Maintain a Completion Checklist
+Internally maintain a checklist. A step may only receive a ✓ when its result has been verified.
+
+## 4. Final State
+At the end of the lab or step, provide a concise completion report.
 
 Lab context: ${labContext}
 
-Current step:
+Current step instructions:
 """
 ${stepText}
 """
 
+You are provided with a screenshot of the current VM state. 
+
 Action types available:
 - {"type":"focus_vm"} — focus the VM window before typing
-- {"type":"type_text","value":"text"} — type text into VM (uses native OS keystrokes). Use for: passwords, commands, form text, usernames
-- {"type":"key","value":"Enter"} — single key press. Values: Enter, Tab, Escape, Space, F1-F12, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, Delete, Backspace
-- {"type":"shortcut","value":"ctrl+v"} — keyboard shortcut. Examples: ctrl+c, ctrl+v, ctrl+a, ctrl+shift+esc, alt+tab, alt+f4
-- {"type":"win_run","value":"notepad.exe"} — open Win+R Run dialog and run a command. Use for opening apps.
-- {"type":"wait","value":2000} — wait N milliseconds. Always add after win_run and after app launches.
+- {"type":"type_text","value":"text"} — type text into VM (uses native keystrokes).
+- {"type":"key","value":"Enter"} — single key press (e.g. Enter, Tab, Escape)
+- {"type":"shortcut","value":"ctrl+v"} — keyboard shortcut
+- {"type":"win_run","value":"cmd.exe"} — open Win+R Run dialog and run command
+- {"type":"wait","value":2000} — wait N milliseconds
 
-If you suspect the VM is at the login screen (e.g., instructions say "Sign in as Administrator"), send {"type":"shortcut","value":"ctrl+alt+delete"} before typing the password!
-
-Common mappings:
-- "Windows Defender Firewall with Advanced Security" → win_run "wf.msc"
-- "Computer Management" → win_run "compmgmt.msc"
-- "Server Manager" → win_run "ServerManager.exe"
-- "Active Directory Users" → win_run "dsa.msc"
-- "Group Policy Management" → win_run "gpmc.msc"
-- "Registry Editor" → win_run "regedit.exe"
-- "Command Prompt as admin" → win_run "cmd.exe" (then use keyboard to run as admin)
-- "PowerShell" → win_run "powershell.exe"
-- "Task Manager" → shortcut "ctrl+shift+esc"
-- "Sign in / login" → type_text the password/username, then key Enter
-
-Rules:
-- Always start with focus_vm
-- After win_run, always add wait 3000
-- After app opens, add wait 2000 before interacting
-- For multi-word app names, use the .msc or .exe form in win_run
-
-Return ONLY the raw JSON array. No explanation, no markdown fences.
-Example: [{"type":"focus_vm"},{"type":"type_text","value":"Pass!Word!"},{"type":"key","value":"Enter"},{"type":"wait","value":2000}]`;
+Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown blocks.
+{
+  "thought": "Your reasoning about the current screen and what to do next to verify or progress",
+  "checklist": ["[✓] Step 1 completed and verified", "[ ] Step 2 not completed"],
+  "actions": [ {"type":"type_text","value":"ls -la"}, {"type":"key","value":"Enter"} ],
+  "status": "in_progress",
+  "report": "Final completion report (only when status is complete)"
+}`;
   }
 
-  // BUG-12 FIX: Retry once with simplified prompt if JSON parse fails
-  async function getActionsForStep(stepText, labContext = "") {
-    const raw = await askAI(buildActionsPrompt(stepText, labContext));
-    if (!raw) return null;
+  async function executeStepLoop(stepText, labContext) {
+    let iterations = 0;
+    const MAX_ITERATIONS = 12;
+    
+    while (iterations < MAX_ITERATIONS && isRunning && !stopRequested) {
+      iterations++;
+      sendStatus(`Verification Loop ${iterations}/${MAX_ITERATIONS}...`, "info");
+      
+      const screenshot = await getScreenshot();
+      if (!screenshot) {
+        sendStatus("Failed to capture screenshot. Retrying...", "warn");
+        await delay(2000);
+        continue;
+      }
 
-    const cleaned = raw.replace(/^```[\w]*\r?\n?/, "").replace(/\r?\n?```\s*$/, "").trim();
-
-    try {
-      const actions = JSON.parse(cleaned);
-      if (Array.isArray(actions) && actions.length > 0) return actions;
-    } catch (_) {
-      sendStatus("AI response was not valid JSON — retrying with simplified prompt...", "warn");
+      const prompt = buildActionsPrompt(stepText, labContext);
+      const raw = await askAI(prompt, screenshot);
+      if (!raw) return false;
+      
+      const cleaned = raw.replace(/^```[\w]*\r?\n?/, "").replace(/\r?\n?```\s*$/, "").trim();
+      let aiResponse;
+      try {
+        aiResponse = JSON.parse(cleaned);
+      } catch (_) {
+        sendStatus("AI response was not valid JSON — retrying...", "warn");
+        await delay(2000);
+        continue;
+      }
+      
+      if (aiResponse.thought) sendStatus(`AI: ${aiResponse.thought.slice(0, 100)}...`, "info");
+      if (aiResponse.checklist) console.log("[Checklist]", aiResponse.checklist);
+      
+      if (aiResponse.actions && aiResponse.actions.length > 0) {
+        dispatchActions(aiResponse.actions);
+        const totalWait = aiResponse.actions.reduce((acc, a) => {
+           if (a.type === 'wait') return acc + Number(a.value || 1000);
+           if (a.type === 'win_run') return acc + 2500 + Number(a.waitAfter || 3000);
+           if (a.type === 'type_text') return acc + 1000 + currentSpeed * 0.3;
+           return acc + 600;
+        }, 0);
+        await delay(totalWait + 3000); // Wait for actions + give screen time to update
+      }
+      
+      if (aiResponse.status === "complete") {
+        sendStatus("AI marked step as COMPLETE.", "success");
+        return true;
+      }
+      if (aiResponse.status === "error") {
+        sendStatus("AI reported an error it cannot fix.", "error");
+        return false;
+      }
+      
+      await delay(1000);
     }
-
-    // BUG-12 FIX: Retry with a simpler prompt
-    const retryPrompt = `Given this lab step, return ONLY a JSON array of actions. No explanation.
-Step: "${stepText.slice(0, 300)}"
-Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"key","value":"Enter"}]`;
-    const retryRaw = await askAI(retryPrompt);
-    if (!retryRaw) return null;
-    const retryCleaned = retryRaw.replace(/^```[\w]*\r?\n?/, "").replace(/\r?\n?```\s*$/, "").trim();
-    try {
-      const actions = JSON.parse(retryCleaned);
-      if (Array.isArray(actions)) return actions;
-    } catch (_) {
-      sendStatus("Retry also failed — skipping step", "error");
-    }
-    return null;
+    return false;
   }
 
   // ─── Execute Actions ────────────────────────────────────────────────────────
@@ -633,24 +675,13 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
       sendStatus(`Step ${stepCount}: "${stepText.slice(0, 90)}..."`, "info");
 
       sendStatus("Asking AI for actions...", "info");
-      const actions = await getActionsForStep(stepText, labContext);
+      
+      const stepSuccess = await executeStepLoop(stepText, labContext);
       if (stopRequested) break;
 
-      if (!actions || actions.length === 0) {
-        sendStatus("AI returned no actions — advancing to next step.", "warn");
+      if (!stepSuccess) {
+        sendStatus("AI could not complete step.", "warn");
       } else {
-        // Dispatch actions to all frames (including ourselves if we have the canvas)
-        dispatchActions(actions);
-        // We calculate total wait time roughly so the master loop doesn't click next too early
-        const totalWait = actions.reduce((acc, a) => {
-           if (a.type === 'wait') return acc + Number(a.value || 1000);
-           if (a.type === 'win_run') return acc + 2500 + Number(a.waitAfter || 3000);
-           if (a.type === 'type_text') return acc + 1000 + currentSpeed * 0.3;
-           return acc + 600;
-        }, 0);
-        await delay(totalWait + 2000); // Wait for actions to complete
-        if (stopRequested) break;
-        
         // ── Check for Verify Button ──
         const clickedVerify = await clickVerify();
         if (clickedVerify) {
@@ -685,11 +716,9 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
         return; 
     }
     sendStatus(`Single step: "${stepText.slice(0, 90)}"`, "info");
-    const actions = await getActionsForStep(stepText, labContext);
-    if (actions?.length) {
-      dispatchActions(actions);
-    } else {
-      sendStatus("AI returned no actions for this step.", "warn");
+    const success = await executeStepLoop(stepText, labContext);
+    if (!success) {
+      sendStatus("AI could not complete this step.", "warn");
     }
   }
 

@@ -2,19 +2,25 @@
 // Sends a prompt to Gemini via the background service worker.
 
 /**
- * Ask Gemini AI a question. Returns the answer string.
+ * Ask Gemini AI a question, optionally with an image. Returns the answer string.
  * @param {string} prompt
+ * @param {string|null} imageBase64
  * @returns {Promise<string>}
  */
-export async function askAI(prompt) {
+export async function askAI(prompt, imageBase64 = null) {
   return new Promise((resolve) => {
     chrome.storage.sync.get(["apiKey"], ({ apiKey }) => {
       if (!apiKey) {
         resolve("");
         return;
       }
-      chrome.runtime.sendMessage({ type: "ASK_AI", prompt, apiKey }, (resp) => {
+      chrome.runtime.sendMessage({ type: "ASK_AI", prompt, apiKey, imageBase64 }, (resp) => {
         if (chrome.runtime.lastError || !resp) { resolve(""); return; }
+        if (resp.error) {
+          console.warn("AI Error:", resp.error);
+          resolve(JSON.stringify({ error: resp.error }));
+          return;
+        }
         resolve(resp.text || "");
       });
     });
