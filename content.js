@@ -7,6 +7,10 @@
 (function () {
   "use strict";
 
+  // Guard: do not run MindTap logic on LOD VM pages
+  // (vm-lab-content.js handles those)
+  if (location.hostname.includes("labondemand.com")) return;
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MODULE: utils
   // ═══════════════════════════════════════════════════════════════════════════
@@ -23,10 +27,21 @@
     return new Promise((resolve) => {
       const existing = document.querySelector(selector);
       if (existing) return resolve(existing);
-      const timer = setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        observer.disconnect();
+        resolve(null);
+      }, timeout);
       const observer = new MutationObserver(() => {
         const el = document.querySelector(selector);
-        if (el) { clearTimeout(timer); observer.disconnect(); resolve(el); }
+        if (el && !settled) {
+          settled = true;
+          clearTimeout(timer);
+          observer.disconnect();
+          resolve(el);
+        }
       });
       observer.observe(document.body, { childList: true, subtree: true });
     });
@@ -40,6 +55,15 @@
     }
   }
 
+  // Strip markdown code fences that Gemini occasionally wraps output in
+  function stripFences(code) {
+    if (!code) return code;
+    return code
+      .replace(/^```[\w]*\r?\n?/, "")
+      .replace(/\r?\n?```\s*$/, "")
+      .trim();
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MODULE: AI
   // ═══════════════════════════════════════════════════════════════════════════
@@ -49,6 +73,12 @@
         if (!apiKey) { resolve(""); return; }
         chrome.runtime.sendMessage({ type: "ASK_AI", prompt, apiKey }, (resp) => {
           if (chrome.runtime.lastError || !resp) { resolve(""); return; }
+          // BUG-13 surface: log API errors but don't crash
+          if (resp.error) {
+            sendStatus(`AI error: ${resp.error}`, "error");
+            resolve("");
+            return;
+          }
           resolve(resp.text || "");
         });
       });
@@ -84,7 +114,8 @@ Problem:
 ${problemStatement}
 
 Reply with ONLY the complete, correct code. No markdown fences, no explanation.`;
-    return await askAI(prompt);
+    const raw = await askAI(prompt);
+    return stripFences(raw);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -110,11 +141,20 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
       (document.querySelector("[class*='instruction']") && document.querySelector("[class*='task-pane']"))
     ) return ActivityType.LAB;
 
-    const radios = document.querySelectorAll("input[type='radio'], input[type='checkbox']");
-    const optionCards = document.querySelectorAll(
-      "[class*='option'], [class*='choice'], [class*='answer-option'], [role='radio'], [role='option']"
-    );
-    if (radios.length > 0 || optionCards.length > 0) return ActivityType.MCQ;
+    // BUG-11 FIX: Require at least 2 visible options inside a content container
+    // to prevent false-positive MCQ detection from unrelated page checkboxes
+    const radios = [...document.querySelectorAll("input[type='radio'], input[type='checkbox']")]
+      .filter(el => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && !el.closest("nav, header, footer, [role='navigation']");
+      });
+    const optionCards = [...document.querySelectorAll(
+      "[class*='answer-option'], [class*='choice-item'], [class*='option-item'], [class*='mc-option'], [role='radio']"
+    )].filter(el => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    });
+    if (radios.length >= 2 || optionCards.length >= 2) return ActivityType.MCQ;
 
     const inputs = document.querySelectorAll(
       "input[type='text'], input[type='number'], textarea, [contenteditable='true']"
@@ -139,13 +179,17 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
     ".stem", ".question", "[role='heading']", "[class*='prompt']"
   ];
 
+  // BUG-09 FIX: Strip option elements from the clone so AI doesn't see options as part of question
   function getQuestionText(container = document) {
     for (const sel of QUESTION_SELECTORS) {
       const el = container.querySelector(sel);
       if (el && el.innerText.trim()) return el.innerText.trim();
     }
     const clone = container.cloneNode(true);
-    clone.querySelectorAll("input, textarea, button, [contenteditable]").forEach(e => e.remove());
+    // Strip interactive elements AND option elements from the fallback text
+    [...OPTION_SELECTORS, "input", "textarea", "button", "[contenteditable]"].forEach(sel => {
+      try { clone.querySelectorAll(sel).forEach(e => e.remove()); } catch (_) {}
+    });
     return clone.innerText.trim().slice(0, 600);
   }
 
@@ -172,7 +216,10 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
     el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     el.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true }));
     el.dispatchEvent(new MouseEvent("click",     { bubbles: true }));
-    if (el.tagName === "INPUT") el.checked = true;
+    if (el.tagName === "INPUT") {
+      el.checked = true;
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
   }
 
   async function handleMCQSet(speed = 1000) {
@@ -204,13 +251,35 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
     "[contenteditable='true'][class*='response']", "[contenteditable='true'][role='textbox']"
   ];
 
+  // BUG-04 FIX: Verify paste actually set the content; fall through to execCommand if not
   function typeIntoField(el, text) {
     el.focus();
     if (el.isContentEditable) {
       el.innerText = "";
       el.focus();
-      document.execCommand("insertText", false, text);
-      el.dispatchEvent(new Event("input",  { bubbles: true }));
+      let inserted = false;
+      // Attempt 1: ClipboardEvent paste (works in some frameworks)
+      try {
+        const dt = new DataTransfer();
+        dt.setData("text/plain", text);
+        el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+        // Check if paste actually set the content (isTrusted=false paste is blocked by frameworks)
+        if (el.innerText.trim() === text.trim()) inserted = true;
+      } catch (_) {}
+      // Attempt 2: execCommand insertText (deprecated but trusted from extension context)
+      if (!inserted) {
+        try {
+          el.focus();
+          document.execCommand("selectAll");
+          document.execCommand("insertText", false, text);
+          if (el.innerText.trim().length > 0) inserted = true;
+        } catch (_) {}
+      }
+      // Attempt 3: Direct innerText assignment (last resort — works but may bypass framework)
+      if (!inserted) {
+        el.innerText = text;
+      }
+      el.dispatchEvent(new InputEvent("input",  { bubbles: true, data: text, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
     } else {
       const proto = el.tagName === "TEXTAREA"
@@ -219,7 +288,7 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
       const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
       if (nativeSetter) nativeSetter.call(el, text);
       else el.value = text;
-      el.dispatchEvent(new Event("input",  { bubbles: true }));
+      el.dispatchEvent(new InputEvent("input",  { bubbles: true, data: text, inputType: "insertText" }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
       el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
     }
@@ -231,6 +300,7 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
     for (const input of inputs) {
       if (input.style.display === "none" || input.disabled) continue;
       if (input.value && input.value.trim()) continue;
+      if (input.isContentEditable && input.innerText?.trim()) continue;
       let label = question;
       const nearbyLabel = input.closest("label") || input.previousElementSibling;
       if (nearbyLabel && nearbyLabel.innerText?.trim()) {
@@ -238,6 +308,7 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
       }
       sendStatus(`Fill-in: "${label.slice(0, 70)}"`, "info");
       const answer = await generateAnswer(label);
+      if (!answer) { sendStatus("AI returned empty answer — skipping field.", "warn"); continue; }
       sendStatus(`Answer: "${answer}"`, "info");
       await delay(speed * 0.3);
       typeIntoField(input, answer);
@@ -334,16 +405,26 @@ Reply with ONLY the complete, correct code. No markdown fences, no explanation.`
     sendStatus("Injecting generated code...", "info");
     await delay(speed * 0.5);
     switch (editor.type) {
-      case "codemirror5": editor.instance.setValue(code); editor.instance.refresh(); break;
-      case "codemirror6": await injectCodeMirror6(editor.el, code); break;
-      case "monaco": for (const m of editor.models) { try { m.setValue(code); break; } catch (_) {} } break;
-      case "ace": editor.instance.setValue(code, -1); break;
-      case "textarea":
+      case "codemirror5":
+        editor.instance.setValue(code);
+        editor.instance.refresh();
+        break;
+      case "codemirror6":
+        await injectCodeMirror6(editor.el, code);
+        break;
+      case "monaco":
+        for (const m of editor.models) { try { m.setValue(code); break; } catch (_) {} }
+        break;
+      case "ace":
+        editor.instance.setValue(code, -1);
+        break;
+      case "textarea": {
         const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
         if (nativeSetter) nativeSetter.call(editor.el, code); else editor.el.value = code;
         editor.el.dispatchEvent(new Event("input",  { bubbles: true }));
         editor.el.dispatchEvent(new Event("change", { bubbles: true }));
         break;
+      }
     }
     await delay(speed);
     return true;
@@ -413,17 +494,25 @@ Which element index should be clicked? Reply with ONLY the number. If none match
   async function handleLab(speed = 1500, maxSteps = 60) {
     let stepsDone = 0;
     let lastInstruction = "";
+    let sameCount = 0;
     while (stepsDone < maxSteps) {
+      if (stopRequested) break;
       await delay(speed);
       const instruction = getStepInstruction();
       if (!instruction) { sendStatus("Lab: no instruction found — done.", "info"); break; }
       if (instruction === lastInstruction) {
-        sendStatus("Lab: instruction unchanged, advancing...", "warn");
+        sameCount++;
+        if (sameCount >= 3) {
+          sendStatus("Lab: instruction stuck after 3 attempts — stopping.", "warn");
+          break;
+        }
+        sendStatus(`Lab: instruction unchanged (attempt ${sameCount}), advancing...`, "warn");
         const advanced = await clickLabNextStep(speed);
         if (!advanced) break;
         stepsDone++;
         continue;
       }
+      sameCount = 0;
       sendStatus(`Lab step ${stepsDone + 1}: "${instruction.slice(0, 80)}"`, "info");
       lastInstruction = instruction;
       const interactables = collectInteractables();
@@ -487,12 +576,47 @@ Which element index should be clicked? Reply with ONLY the number. If none match
     return null;
   }
 
+  // BUG-07 FIX: Cap debounce at 1500ms max to handle fast SPA transitions
   function waitForPageAdvance(timeout = 8000) {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => { observer.disconnect(); resolve(false); }, timeout);
+      let debounceTimer = null;
+      let settled = false;
+      const DEBOUNCE_MS = 500;
+      const MAX_DEBOUNCE_WAIT = 1500; // don't debounce forever
+      let firstMutationAt = null;
+
+      const hardTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (debounceTimer) clearTimeout(debounceTimer);
+        observer.disconnect();
+        resolve(false);
+      }, timeout);
+
       const observer = new MutationObserver(() => {
-        clearTimeout(timer); observer.disconnect(); resolve(true);
+        if (settled) return;
+        if (!firstMutationAt) firstMutationAt = Date.now();
+
+        if (debounceTimer) clearTimeout(debounceTimer);
+
+        // If mutations have been coming for more than MAX_DEBOUNCE_WAIT, resolve now
+        if (Date.now() - firstMutationAt > MAX_DEBOUNCE_WAIT) {
+          settled = true;
+          clearTimeout(hardTimer);
+          observer.disconnect();
+          resolve(true);
+          return;
+        }
+
+        debounceTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(hardTimer);
+          observer.disconnect();
+          resolve(true);
+        }, DEBOUNCE_MS);
       });
+
       observer.observe(document.body, { childList: true, subtree: true });
     });
   }
@@ -560,7 +684,7 @@ Which element index should be clicked? Reply with ONLY the number. If none match
       sendResponse({ ok: true });
     }
     if (msg.type === "PING") {
-      sendResponse({ alive: true });
+      sendResponse({ alive: true, mode: "mindtap" });
     }
     return true;
   });
@@ -576,17 +700,26 @@ Which element index should be clicked? Reply with ONLY the number. If none match
 
     while (isRunning && !stopRequested && iterations < MAX_ITER) {
       iterations++;
+
       if (isAssignmentComplete()) {
         sendStatus("🎉 Assignment complete!", "success");
         isRunning = false;
         break;
       }
+
       const activityType = detectActivity();
       sendStatus(`Detected: ${activityType} (step ${iterations})`, "info");
+
       try {
-        if (activityType === ActivityType.MCQ)     await handleMCQSet(currentSpeed);
-        if (activityType === ActivityType.FILLIN)  await handleFillin(currentSpeed);
-        if (activityType === ActivityType.CODING)  await handleCoding(currentSpeed);
+        if (activityType === ActivityType.MCQ)    await handleMCQSet(currentSpeed);
+        if (stopRequested) break;
+
+        if (activityType === ActivityType.FILLIN) await handleFillin(currentSpeed);
+        if (stopRequested) break;
+
+        if (activityType === ActivityType.CODING) await handleCoding(currentSpeed);
+        if (stopRequested) break;
+
         if (activityType === ActivityType.LAB) {
           await handleLab(currentSpeed);
           isRunning = false;
@@ -595,14 +728,19 @@ Which element index should be clicked? Reply with ONLY the number. If none match
       } catch (err) {
         sendStatus(`Handler error: ${err.message}`, "error");
       }
+
+      if (stopRequested) break;
       await delay(currentSpeed * 0.5);
       await confirmDialog(500);
+      if (stopRequested) break;
+
       const advanced = await advance(currentSpeed);
       if (!advanced) {
         sendStatus("Could not advance — stopping.", "error");
         isRunning = false;
         break;
       }
+      if (stopRequested) break;
       await delay(currentSpeed);
     }
 

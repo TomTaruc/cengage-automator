@@ -281,3 +281,38 @@ body {
 .status-card.running {
   animation: pulse-border 1.5s ease-in-out infinite;
 }
+
+/* ── VM Lab Mode badge ── */
+.mode-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 20px;
+  background: linear-gradient(135deg, rgba(255,165,0,0.15), rgba(255,100,0,0.08));
+  border: 1px solid rgba(255,165,0,0.35);
+  color: #ffaa00;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  margin-bottom: -2px;
+  transition: opacity 0.3s;
+}
+.mode-badge--hidden {
+  display: none;
+}
+.mode-badge svg {
+  flex-shrink: 0;
+  fill: #ffaa00;
+}
+
+/* ── VM running pulse (amber) ── */
+@keyframes pulse-border-vm {
+  0%, 100% { border-color: rgba(255,165,0,0.2); }
+  50%       { border-color: rgba(255,165,0,0.7); }
+}
+.status-card.running-vm {
+  animation: pulse-border-vm 1.5s ease-in-out infinite;
+  background: linear-gradient(135deg, rgba(255,165,0,0.06), rgba(255,100,0,0.04));
+}
+

@@ -1,17 +1,21 @@
 {
   "manifest_version": 3,
   "name": "Cengage MindTap Automator",
-  "version": "1.0.0",
-  "description": "Automates MindTap labs, quizzes, coding labs and step-through simulations using Gemini AI.",
+  "version": "1.2.0",
+  "description": "Automates MindTap labs, quizzes, coding labs, step simulations and VM-based labs using Gemini AI.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "clipboardWrite",
+    "clipboardRead"
   ],
   "host_permissions": [
     "https://*.cengage.com/*",
     "https://*.mindtap.cengage.com/*",
+    "https://labclient.labondemand.com/*",
+    "https://*.labondemand.com/*",
     "https://generativelanguage.googleapis.com/*"
   ],
   "background": {
@@ -26,8 +30,21 @@
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": true
+    },
+    {
+      "matches": [
+        "https://labclient.labondemand.com/*",
+        "https://*.labondemand.com/*",
+        "https://*.cengage.com/*"
+      ],
+      "js": ["vm-lab-content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com"
+  },
   "action": {
     "default_popup": "popup/popup.html",
     "default_title": "Cengage Automator",

@@ -17,8 +17,11 @@ const btnStep       = $("btn-step");
 const logArea       = $("log-area");
 const clearLogBtn   = $("clear-log");
 const statusCard    = document.querySelector(".status-card");
+const modeBadge     = $("mode-badge");
+const modeLabel     = $("mode-label");
 
-let isRunning = false;
+let isRunning  = false;
+let isVMMode   = false;  // true when on labclient.labondemand.com
 
 // ─── Speed labels ─────────────────────────────────────────────────────────────
 const speedLabels = { "1": "Slow", "2": "Medium", "3": "Fast" };
@@ -34,18 +37,19 @@ function addLog(message, type = "info") {
   logArea.scrollTop = logArea.scrollHeight;
 }
 
-// ─── Status update ────────────────────────────────────────────────────────────
+// ─── Running state ────────────────────────────────────────────────────────────
 function setRunningState(running) {
   isRunning = running;
   btnStart.disabled = running;
   btnStop.disabled  = !running;
   btnStep.disabled  = running;
   if (running) {
-    statusLabel.textContent = "Running…";
-    statusCard.classList.add("running");
+    statusLabel.textContent = isVMMode ? "Running VM…" : "Running…";
+    statusCard.classList.add(isVMMode ? "running-vm" : "running");
+    statusCard.classList.remove(isVMMode ? "running" : "running-vm");
   } else {
     statusLabel.textContent = "Ready";
-    statusCard.classList.remove("running");
+    statusCard.classList.remove("running", "running-vm");
   }
 }
 
@@ -78,37 +82,58 @@ toggleKeyBtn.addEventListener("click", () => {
     : `<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>`;
 });
 
-// ─── Send message to content script ──────────────────────────────────────────
-async function sendToContent(type, extra = {}) {
-  return new Promise((resolve) => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const tab = tabs[0];
-      if (!tab) { resolve(null); return; }
-
-      chrome.tabs.sendMessage(tab.id, { type, speed: speedSlider.value, ...extra }, (resp) => {
-        if (chrome.runtime.lastError) {
-          addLog("Could not reach content script. Refresh the MindTap page.", "error");
-          resolve(null);
-          return;
-        }
-        resolve(resp);
-      });
-    });
-  });
+// ─── Detect page mode ─────────────────────────────────────────────────────────
+function detectPageMode(url) {
+  if (!url) return "unknown";
+  if (url.includes("labondemand.com")) return "vm-lab";
+  if (url.includes("cengage.com") || url.includes("mindtap")) return "mindtap";
+  return "unknown";
 }
 
-// ─── Check if on MindTap ─────────────────────────────────────────────────────
+// ─── Check current page & update badge ───────────────────────────────────────
 async function checkCurrentPage() {
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0];
       if (!tab) { resolve(false); return; }
       const url = tab.url || "";
-      const isMindTap = url.includes("cengage.com") || url.includes("mindtap");
-      pageStatus.textContent = isMindTap
-        ? `✓ MindTap detected — ${url.slice(0, 50)}...`
-        : `⚠ Not on a MindTap page`;
-      resolve(isMindTap);
+      const mode = detectPageMode(url);
+      isVMMode = (mode === "vm-lab");
+
+      if (mode === "vm-lab") {
+        // Show orange VM Lab Mode badge
+        modeBadge.classList.remove("mode-badge--hidden");
+        modeLabel.textContent = "🖥️ VM Lab Mode";
+        pageStatus.textContent = `✓ VM Lab detected — ${url.slice(0, 45)}...`;
+        btnStep.title = "Execute current step only";
+        resolve(true);
+      } else if (mode === "mindtap") {
+        modeBadge.classList.add("mode-badge--hidden");
+        pageStatus.textContent = `✓ MindTap detected — ${url.slice(0, 45)}...`;
+        resolve(true);
+      } else {
+        modeBadge.classList.add("mode-badge--hidden");
+        pageStatus.textContent = `⚠ Not on a MindTap or VM lab page`;
+        resolve(false);
+      }
+    });
+  });
+}
+
+// ─── Send message to content script ──────────────────────────────────────────
+async function sendToContent(type, extra = {}) {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0];
+      if (!tab) { resolve(null); return; }
+      chrome.tabs.sendMessage(tab.id, { type, speed: speedSlider.value, ...extra }, (resp) => {
+        if (chrome.runtime.lastError) {
+          addLog("Could not reach content script. Refresh the page first.", "error");
+          resolve(null);
+          return;
+        }
+        resolve(resp);
+      });
     });
   });
 }
@@ -120,14 +145,20 @@ btnStart.addEventListener("click", async () => {
     apiKeyInput.focus();
     return;
   }
-  const onMindTap = await checkCurrentPage();
-  if (!onMindTap) {
-    addLog("Navigate to a MindTap activity page first.", "warn");
+  const onSupportedPage = await checkCurrentPage();
+  if (!onSupportedPage) {
+    addLog("Navigate to a MindTap activity or Cengage VM lab first.", "warn");
     return;
   }
-  addLog("Starting automation…", "info");
+
+  addLog(isVMMode ? "Starting VM lab automation…" : "Starting automation…", "info");
   setRunningState(true);
-  await sendToContent("START_AUTOMATION");
+
+  if (isVMMode) {
+    await sendToContent("START_VM_LAB");
+  } else {
+    await sendToContent("START_AUTOMATION");
+  }
 });
 
 btnStop.addEventListener("click", async () => {
@@ -141,8 +172,12 @@ btnStep.addEventListener("click", async () => {
     addLog("Please enter your Gemini API key first.", "warn");
     return;
   }
-  addLog("Stepping once…", "info");
-  await sendToContent("STEP_ONCE");
+  addLog(isVMMode ? "Executing single VM step…" : "Stepping once…", "info");
+  if (isVMMode) {
+    await sendToContent("STEP_ONCE_VM");
+  } else {
+    await sendToContent("STEP_ONCE");
+  }
 });
 
 clearLogBtn.addEventListener("click", () => {
@@ -154,15 +189,29 @@ clearLogBtn.addEventListener("click", () => {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "STATUS_UPDATE") {
     addLog(msg.message, msg.statusType || "info");
-    // Detect completion
-    if (msg.statusType === "success" && msg.message.includes("complete")) {
+
+    const messageLC = (msg.message || "").toLowerCase();
+    const completionPhrases = ["complete", "lab done", "🎉", "lab automation ended", "lab finished"];
+    const stopPhrases = ["stopping", "stopped", "could not advance", "max iterations", "max steps", "cannot advance"];
+
+    if (msg.statusType === "success" && completionPhrases.some(p => messageLC.includes(p))) {
       setRunningState(false);
     }
-    if (msg.statusType === "error" && msg.message.includes("stopping")) {
+    if ((msg.statusType === "error" || msg.statusType === "warn") && stopPhrases.some(p => messageLC.includes(p))) {
+      setRunningState(false);
+    }
+    if (msg.statusType === "warn" && (messageLC.includes("stopped by user") || messageLC.includes("stopped"))) {
       setRunningState(false);
     }
   }
 });
 
+// ─── Refresh page status on tab change ───────────────────────────────────────
+chrome.tabs.onActivated.addListener(() => { try { checkCurrentPage(); } catch (_) {} });
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "complete") { try { checkCurrentPage(); } catch (_) {} }
+});
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 checkCurrentPage();
+
