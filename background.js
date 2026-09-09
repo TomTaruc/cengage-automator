@@ -21,15 +21,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   // ── STATUS_UPDATE relay ───────────────────────────────────────────────────
-  // BUG-01 FIX: Only relay messages that originate from a content script
-  // (sender.tab is defined). Extension pages (popup) send directly to the
-  // runtime and the popup receives them immediately — relaying those would
-  // cause duplicate log entries.
   if (msg.type === "STATUS_UPDATE" && sender.tab) {
-    // Forward to popup (or any other extension page that is open).
-    // This is a fire-and-forget; popup may not be open — suppress the error.
     chrome.runtime.sendMessage(msg).catch(() => {});
-    // Do NOT call sendResponse; content script does not await this.
+    return false;
+  }
+
+  // ── VM_ACTION relay (Cross-frame communication) ───────────────────────────
+  // If the instructions are in an iframe but the VM canvas is in the top frame,
+  // the iframe sends VM_ACTION here, and we broadcast it to all frames in the tab.
+  if (msg.type === "VM_ACTION" && sender.tab) {
+    chrome.tabs.sendMessage(sender.tab.id, msg).catch(() => {});
     return false;
   }
 });

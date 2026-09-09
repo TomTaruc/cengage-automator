@@ -12,11 +12,7 @@
     "clipboardRead"
   ],
   "host_permissions": [
-    "https://*.cengage.com/*",
-    "https://*.mindtap.cengage.com/*",
-    "https://labclient.labondemand.com/*",
-    "https://*.labondemand.com/*",
-    "https://generativelanguage.googleapis.com/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"
@@ -33,9 +29,7 @@
     },
     {
       "matches": [
-        "https://labclient.labondemand.com/*",
-        "https://*.labondemand.com/*",
-        "https://*.cengage.com/*"
+        "<all_urls>"
       ],
       "js": ["vm-lab-content.js"],
       "run_at": "document_idle",

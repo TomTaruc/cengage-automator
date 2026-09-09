@@ -12,13 +12,9 @@
 (function () {
   "use strict";
 
-  // Guard: only run when we're the top frame OR inside a Cengage iframe on LOD
-  // Don't interfere with completely unrelated iframes
-  const hostname = location.hostname;
-  const isCengageFrame = hostname.includes("cengage.com");
-  const isLODFrame     = hostname.includes("labondemand.com");
-  if (!isLODFrame && !isCengageFrame) return;
-
+  // Broad injection allows this script to enter all iframes (including cross-origin LOD frames)
+  // We don't block by hostname anymore because LOD uses many random iframe domains (skillable.com, etc)
+  
   // ─── State ─────────────────────────────────────────────────────────────────
   let isRunning     = false;
   let stopRequested = false;
@@ -219,7 +215,7 @@
         }
       } catch (_) {}
     }
-    return null; // Signal that active step wasn't found
+    return null; 
   }
 
   function getFullPanelText() {
@@ -231,14 +227,26 @@
         }
       } catch (_) {}
     }
-    // Last resort: scan right 30% of viewport
+    
+    // If we are inside an iframe, just grab the whole body text if it's substantial
+    if (window.self !== window.top) {
+      const text = document.body.innerText?.trim();
+      if (text && text.length > 80) return cleanStepText(text);
+    }
+
+    // Last resort: scan right side of viewport aggressively
     const viewW = window.innerWidth;
-    const allDivs = [...document.querySelectorAll("div, section, aside")];
-    for (const div of allDivs) {
-      const rect = div.getBoundingClientRect();
-      if (rect.left > viewW * 0.55 && rect.width > 80 && rect.height > 100) {
-        const text = div.innerText?.trim();
-        if (text && text.length > 50) return cleanStepText(text);
+    const elements = [...document.querySelectorAll("div, section, aside, main, article, .CodeMirror, iframe")];
+    
+    for (const el of elements) {
+      const rect = el.getBoundingClientRect();
+      // If element is on the right half of the screen
+      if (rect.left > viewW * 0.45 && rect.width > 80 && rect.height > 100) {
+        // If it's an iframe, we can't read it here (CORS), but the iframe's own script will catch it.
+        if (el.tagName === "IFRAME") continue;
+        
+        const text = el.innerText?.trim();
+        if (text && text.length > 80) return cleanStepText(text);
       }
     }
     return "";
@@ -527,13 +535,21 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
     }
   }
 
-  async function executeActions(actions) {
+  async function executeActionsLocally(actions) {
     if (!actions?.length) return;
     sendStatus(`Executing ${actions.length} action(s)...`, "info");
     for (const action of actions) {
       if (stopRequested) break;
       await executeAction(action);
     }
+  }
+
+  // ─── Cross-Frame Execution ──────────────────────────────────────────────────
+  function dispatchActions(actions) {
+    if (!actions || actions.length === 0) return;
+    // We send to background, which broadcasts to ALL frames in the active tab
+    // So the frame holding the VM canvas will catch it and execute
+    chrome.runtime.sendMessage({ type: "VM_ACTION", actions });
   }
 
   // ─── Navigation ─────────────────────────────────────────────────────────────
@@ -614,13 +630,24 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
       if (isLabComplete()) { sendStatus("🎉 Lab complete!", "success"); break; }
 
       const stepText = getCurrentStepText();
+      
+      // If we found NO instructions, this frame might just be the canvas frame.
+      // We shouldn't spam "No instruction found" unless we were previously finding them.
       if (!stepText) {
+        if (stepCount === 1) {
+           // We are not the master frame (likely the canvas frame). Just wait.
+           // We will act when we receive VM_ACTION messages.
+           sendStatus("Acting as Canvas node (no instructions found here)", "info");
+           return; 
+        }
         sendStatus("No step instruction found — waiting...", "warn");
         await delay(3000);
         sameStepCount++;
         if (sameStepCount >= 4) { sendStatus("No instructions found — stopping.", "error"); break; }
         continue;
       }
+
+      sameStepCount = 0;
 
       if (stepText === lastStepText) {
         sameStepCount++;
@@ -648,7 +675,16 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
       if (!actions || actions.length === 0) {
         sendStatus("AI returned no actions — advancing to next step.", "warn");
       } else {
-        await executeActions(actions);
+        // Dispatch actions to all frames (including ourselves if we have the canvas)
+        dispatchActions(actions);
+        // We calculate total wait time roughly so the master loop doesn't click next too early
+        const totalWait = actions.reduce((acc, a) => {
+           if (a.type === 'wait') return acc + Number(a.value || 1000);
+           if (a.type === 'win_run') return acc + 2500 + Number(a.waitAfter || 3000);
+           if (a.type === 'type_text') return acc + 1000 + currentSpeed * 0.3;
+           return acc + 600;
+        }, 0);
+        await delay(totalWait + 1000);
         if (stopRequested) break;
         await delay(currentSpeed * 0.5);
       }
@@ -665,11 +701,14 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
   async function stepOnceVM() {
     const labContext = detectLabContext();
     const stepText = getCurrentStepText();
-    if (!stepText) { sendStatus("No step instruction found.", "warn"); return; }
+    if (!stepText) { 
+        // Silent if canvas node
+        return; 
+    }
     sendStatus(`Single step: "${stepText.slice(0, 90)}"`, "info");
     const actions = await getActionsForStep(stepText, labContext);
     if (actions?.length) {
-      await executeActions(actions);
+      dispatchActions(actions);
     } else {
       sendStatus("AI returned no actions for this step.", "warn");
     }
@@ -692,6 +731,13 @@ Reply format: [{"type":"focus_vm"},{"type":"type_text","value":"..."},{"type":"k
       currentSpeed = speedToMs(msg.speed || 2);
       stepOnceVM();
       sendResponse({ ok: true });
+    }
+    if (msg.type === "VM_ACTION") {
+      // If we receive this message, check if we have the VM canvas.
+      // Only the frame with the VM canvas should execute keyboard/paste actions.
+      if (getVMCanvas() || document.querySelector("iframe")) {
+         executeActionsLocally(msg.actions);
+      }
     }
     if (msg.type === "PING") {
       sendResponse({ alive: true, mode: "vm-lab" });
