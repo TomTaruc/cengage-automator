@@ -24,12 +24,65 @@
   "use strict";
 
   // ─── Frame Guard ────────────────────────────────────────────────────────────
-  // Cross-origin iframes each see window.self === window.top as TRUE, so the old
-  // IS_TOP_FRAME check fails on LOD pages (instructions + VM are separate origins).
-  // We use chrome.storage.local as a distributed mutex: the first frame to
-  // acquire the "vmMasterFrame" key becomes the master and runs the control loop.
-  // All other frames only execute VM_ACTION messages (keystrokes/clicks in the VM).
-  let IS_MASTER_FRAME = false; // set async via tryAcquireMasterLock()
+  // The key insight: LOD pages load the VM canvas in the top frame and the
+  // instructions in a CROSS-ORIGIN sub-iframe. Both frames run this script.
+  // The old blind race let the top/VM frame win master — but it has no instructions.
+  //
+  // Fix: master election is CAPABILITY-BASED.
+  //   • A frame that can find instruction text → "instructions-capable" (priority 2)
+  //   • A frame that can find the VM canvas    → "canvas-capable" (priority 1)
+  //   • A frame that has neither               → "unknown" (priority 0)
+  //
+  // The highest-priority frame wins master.  Canvas frames become VM executors.
+  // If two frames have equal priority we fall back to the storage race.
+  let IS_MASTER_FRAME = false;
+  let IS_CANVAS_FRAME = false; // set after capability probe
+
+  function probeCapability() {
+    // Check for instructions
+    const hasInstructions = !!(
+      document.querySelector("#instructionsContent") ||
+      document.querySelector("#pages") ||
+      document.querySelector(".task-list-item") ||
+      document.querySelector(".lab-instructions") ||
+      document.querySelector(".instructions-content") ||
+      document.querySelector("[class*='instruction']") ||
+      document.querySelector("[class*='step-content']") ||
+      document.querySelector("[class*='task-content']")
+    );
+    // If no known selector matched, check for substantial text on the right side
+    let hasInstructionText = hasInstructions;
+    if (!hasInstructionText) {
+      const viewW = window.innerWidth;
+      const candidates = [...document.querySelectorAll("div, section, aside, article")];
+      for (const el of candidates) {
+        try {
+          const rect = el.getBoundingClientRect();
+          const text = el.innerText?.trim() || "";
+          if (rect.left > viewW * 0.35 && text.length > 80 &&
+              /\b(step|task|configure|install|open|click|enter|run|verify|enable|create|navigate|command|type)\b/i.test(text)) {
+            hasInstructionText = true;
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Check for VM canvas
+    const hasCanvas = !!(
+      document.querySelector("canvas") ||
+      document.querySelector("iframe[id*='vm']") ||
+      document.querySelector("iframe[src*='vm']") ||
+      document.querySelector("[class*='vm-screen']") ||
+      document.querySelector("[class*='remote-display']")
+    );
+
+    IS_CANVAS_FRAME = hasCanvas && !hasInstructionText;
+
+    if (hasInstructionText) return 2;   // instructions frame — should be master
+    if (hasCanvas) return 1;            // VM/canvas frame — executor
+    return 0;                           // unknown
+  }
 
   function tryAcquireMasterLock() {
     return new Promise(resolve => {
@@ -37,14 +90,34 @@
         resolve(false);
         return;
       }
-      const myToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      // Write our token, then read back after a short race window
-      chrome.storage.local.set({ vmMasterFrame: myToken }, () => {
+
+      const priority = probeCapability();
+      const myToken = `${Date.now()}-P${priority}-${Math.random().toString(36).slice(2)}`;
+
+      // Write our token with priority embedded
+      chrome.storage.local.set({ vmMasterFrame: myToken, vmMasterPriority: priority }, () => {
+        // Wait for race window — higher-priority frames will overwrite lower ones
         setTimeout(() => {
-          chrome.storage.local.get(["vmMasterFrame"], ({ vmMasterFrame }) => {
-            resolve(vmMasterFrame === myToken);
+          chrome.storage.local.get(["vmMasterFrame", "vmMasterPriority"], (data) => {
+            const currentToken = data.vmMasterFrame;
+            const currentPriority = data.vmMasterPriority || 0;
+
+            // If a higher-priority frame already claimed it, yield
+            if (currentPriority > priority) {
+              resolve(false);
+              return;
+            }
+
+            // If same priority, use token equality (first writer wins among equals)
+            if (currentToken === myToken) {
+              resolve(true);
+              return;
+            }
+
+            // Another frame of equal or higher priority won
+            resolve(false);
           });
-        }, 80 + Math.random() * 120); // 80-200ms race window
+        }, 100 + Math.random() * 150); // 100-250ms race window
       });
     }).catch(e => {
       console.error("[VM-Automator] Lock error:", e);
@@ -54,7 +127,7 @@
 
   function releaseMasterLock() {
     if (chrome.storage && chrome.storage.local) {
-      chrome.storage.local.remove("vmMasterFrame");
+      chrome.storage.local.remove(["vmMasterFrame", "vmMasterPriority"]);
     }
   }
 
@@ -1217,15 +1290,16 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
     if (msg.type === "START_VM_LAB") {
       // Use the master lock to elect exactly ONE frame as controller.
-      // All other frames will silently skip.
+      // The frame with the highest capability priority wins (instructions > canvas > unknown).
       tryAcquireMasterLock().then(isMaster => {
         IS_MASTER_FRAME = isMaster;
+        const cap = IS_CANVAS_FRAME ? "canvas" : (isMaster ? "instructions" : "unknown");
         if (isMaster) {
-          sendStatus("🔒 Master frame elected — starting control loop.", "info");
+          sendStatus(`🔒 Master frame elected [${cap}] — starting control loop. URL: ${location.href.slice(0, 60)}`, "info");
           currentSpeed = speedToMs(msg.speed || 2);
           runVMLab();
         } else {
-          sendStatus("🔕 Sub-frame: will execute VM actions only.", "info");
+          sendStatus(`🔕 Sub-frame [${cap}]: will execute VM actions only. URL: ${location.href.slice(0, 60)}`, "info");
         }
       });
       sendResponse({ ok: true });
@@ -1254,15 +1328,14 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
     if (msg.type === "VM_ACTION") {
       // Execute keystrokes in frames that have the VM canvas.
-      // If the master frame itself also contains the canvas (some LOD layouts merge
-      // instructions + VM into one frame), allow it to execute actions too.
-      const hasCanvas = !!getVMCanvas();
-      const isCanvasFrame = hasCanvas || !!document.querySelector("canvas");
-      if (isCanvasFrame && !IS_MASTER_FRAME) {
+      // IS_CANVAS_FRAME is set during capability probe at startup (probeCapability).
+      // Also check live in case the canvas loaded after the probe.
+      const hasCanvas = IS_CANVAS_FRAME || !!getVMCanvas() || !!document.querySelector("canvas");
+      if (hasCanvas && !IS_MASTER_FRAME) {
         // Sub-frame with canvas: execute and ACK
         executeActionsLocally(msg.actions);
         sendResponse({ executed: true, frame: "sub" });
-      } else if (isCanvasFrame && IS_MASTER_FRAME) {
+      } else if (hasCanvas && IS_MASTER_FRAME) {
         // Master frame also has the canvas (single-frame LOD layout)
         executeActionsLocally(msg.actions);
         sendResponse({ executed: true, frame: "master-canvas" });
