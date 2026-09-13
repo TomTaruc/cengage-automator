@@ -1,24 +1,34 @@
 // =============================================================================
-// Cengage VM Lab Automator — vm-lab-content.js
+// Cengage VM Lab Automator — vm-lab-content.js  v3.0
 // Runs on labclient.labondemand.com (Lab on Demand / Cengage virtual labs).
 //
-// Architecture:
-//   1. Reads step instructions from the Cengage right panel
-//   2. Sends them to Gemini AI to get a list of keyboard/type actions
-//   3. Executes those actions (Type Text button + clipboard injection + key events)
-//   4. Clicks "Next" in the Cengage panel and repeats
+// Architecture (v3.0 — Full Persona Agent):
+//   Phase 0 – "Read the Entire Task First"
+//     • Scrapes ALL right-side instruction text (every step, sub-step, note).
+//     • Sends the full task to AI to produce a numbered checklist.
+//   Phase 1 – Per-step visual verification loop
+//     • Screenshots the VM → sends step text + screenshot → AI returns JSON.
+//     • JSON includes: thought, checklist update, actions[], status, error_reason.
+//     • Executes actions in the VM, waits, re-screenshots to verify.
+//     • On error: AI is shown the error screenshot and asked to diagnose & fix.
+//     • Loop continues (up to MAX_ITERATIONS) until AI says "complete".
+//   Phase 2 – After each step
+//     • Clicks "Verify" if present; checks result.
+//     • Advances to next step only after verification passes.
+//   Phase 3 – Pre-submission review
+//     • Re-reads all instructions, asks AI if anything was missed.
+//     • Only then allows submit / lab-complete.
 // =============================================================================
 
 (function () {
   "use strict";
 
-  // Broad injection allows this script to enter all iframes (including cross-origin LOD frames)
-  // We don't block by hostname anymore because LOD uses many random iframe domains (skillable.com, etc)
-  
   // ─── State ─────────────────────────────────────────────────────────────────
-  let isRunning     = false;
-  let stopRequested = false;
-  let currentSpeed  = 1500;
+  let isRunning      = false;
+  let stopRequested  = false;
+  let currentSpeed   = 1500;
+  let globalChecklist = [];   // persists across steps
+  let fullTaskText    = "";   // cached full task (Phase 0)
 
   // ─── Utilities ─────────────────────────────────────────────────────────────
   function delay(ms) {
@@ -57,37 +67,14 @@
     return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
   }
 
-  function waitForEl(selectors, timeout = 5000) {
-    return new Promise(resolve => {
-      const found = findFirst(selectors);
-      if (found) return resolve(found);
-      let settled = false;
-      const t = setTimeout(() => {
-        if (!settled) { settled = true; obs.disconnect(); resolve(null); }
-      }, timeout);
-      const obs = new MutationObserver(() => {
-        const el = findFirst(selectors);
-        if (el && !settled) {
-          settled = true;
-          clearTimeout(t);
-          obs.disconnect();
-          resolve(el);
-        }
-      });
-      obs.observe(document.body, { childList: true, subtree: true });
-    });
-  }
-
   // ─── Selectors ───────────────────────────────────────────────────────────────
 
   // Cengage instruction panel (right side on LOD pages)
   const STEP_TEXT_SELECTORS = [
-    // LOD / Skillable specific
     ".instructions-content",
     ".lab-instructions",
     "#instructions-tab-content",
     ".lod-instructions",
-    // Cengage generic
     "[class*='instruction-content']",
     "[class*='instructions-panel']",
     "[class*='step-content']",
@@ -120,50 +107,8 @@
     ".next-step",
     "[data-action='next']",
     "[class*='step-next']",
-    // LOD specific
     ".lod-next-button",
     "button.btn-primary"
-  ];
-
-  // Cengage "Type Text" clipboard icon — injects text into the VM
-  const TYPE_TEXT_BTN_SELECTORS = [
-    "[title='Type Text']",
-    "[aria-label='Type Text']",
-    "[title*='Type Text']",
-    "[class*='typetext']:not(input)",
-    "[class*='type-text']:not(input)",
-    "[data-action*='typetext']",
-    ".fa-keyboard",
-    "button[title*='keyboard']",
-    // Broader fallback
-    "[class*='clipboard']",
-    ".fa-clipboard"
-  ];
-
-  // Input in the Type Text dialog
-  const TYPE_TEXT_INPUT_SELECTORS = [
-    "[class*='typetext'] textarea",
-    "[class*='typetext'] input[type='text']",
-    "[class*='type-text'] textarea",
-    "[class*='type-text'] input[type='text']",
-    "dialog textarea",
-    "dialog input[type='text']",
-    ".modal textarea",
-    ".modal input[type='text']",
-    "[role='dialog'] textarea",
-    "[role='dialog'] input[type='text']"
-  ];
-
-  const TYPE_TEXT_SUBMIT_SELECTORS = [
-    "[class*='typetext'] button[class*='submit']",
-    "[class*='typetext'] button[class*='ok']",
-    "[class*='typetext'] button[class*='confirm']",
-    "[class*='typetext'] button[class*='enter']",
-    "dialog button[class*='ok']",
-    "dialog button[class*='submit']",
-    "dialog button[class*='confirm']",
-    "[role='dialog'] button[class*='ok']",
-    "[role='dialog'] button[class*='primary']"
   ];
 
   // VM remote desktop canvas or display element
@@ -181,7 +126,6 @@
   ];
 
   // ─── Noise patterns to strip from step text ─────────────────────────────────
-  // BUG-10 FIX: Remove UI noise before sending to AI
   const NOISE_PATTERNS = [
     /hints?\s+enabled/gi,
     /\d+\s+minutes?\s+remaining/gi,
@@ -200,13 +144,12 @@
     for (const pattern of NOISE_PATTERNS) {
       text = text.replace(pattern, "");
     }
-    // Collapse excess whitespace
-    return text.replace(/\n{3,}/g, "\n\n").trim().slice(0, 1500);
+    return text.replace(/\n{3,}/g, "\n\n").trim();
   }
 
-  // ─── Read Current Step ──────────────────────────────────────────────────────
+  // ─── Read Instructions ──────────────────────────────────────────────────────
+
   function getActiveStepInstruction() {
-    // Try to get just the current/active step
     for (const sel of ACTIVE_STEP_SELECTORS) {
       try {
         const el = document.querySelector(sel);
@@ -215,7 +158,7 @@
         }
       } catch (_) {}
     }
-    return null; 
+    return null;
   }
 
   function getFullPanelText() {
@@ -227,29 +170,44 @@
         }
       } catch (_) {}
     }
-    
-    // If we are inside an iframe, just grab the whole body text if it's substantial
+
     if (window.self !== window.top) {
       const text = document.body.innerText?.trim();
       if (text && text.length > 80) return cleanStepText(text);
     }
 
-    // Last resort: scan right side of viewport aggressively
+    // Last resort: scan right side of viewport
     const viewW = window.innerWidth;
-    const elements = [...document.querySelectorAll("div, section, aside, main, article, .CodeMirror, iframe")];
-    
+    const elements = [...document.querySelectorAll("div, section, aside, main, article, iframe")];
     for (const el of elements) {
       const rect = el.getBoundingClientRect();
-      // If element is on the right half of the screen
       if (rect.left > viewW * 0.45 && rect.width > 80 && rect.height > 100) {
-        // If it's an iframe, we can't read it here (CORS), but the iframe's own script will catch it.
         if (el.tagName === "IFRAME") continue;
-        
         const text = el.innerText?.trim();
         if (text && text.length > 80) return cleanStepText(text);
       }
     }
     return "";
+  }
+
+  /**
+   * Attempt to read ALL instructions visible in the panel, not just the current step.
+   * Used for Phase 0 (read-entire-task-first).
+   */
+  function getAllInstructionsText() {
+    // Try to grab the entire instruction container
+    for (const sel of STEP_TEXT_SELECTORS) {
+      try {
+        const el = document.querySelector(sel);
+        if (el && el.innerText?.trim().length > 50) {
+          // Don't truncate here — we want all of it
+          return cleanStepText(el.innerText.trim()).slice(0, 4000);
+        }
+      } catch (_) {}
+    }
+    // Fallback to body
+    const body = document.body.innerText?.trim() || "";
+    return cleanStepText(body).slice(0, 4000);
   }
 
   function getCurrentStepText() {
@@ -264,7 +222,6 @@
   function focusVM() {
     const canvas = getVMCanvas();
     if (canvas) { canvas.click(); canvas.focus(); return true; }
-    // If canvas is inside an iframe we can't directly focus, click the iframe area
     const iframe = document.querySelector("iframe");
     if (iframe) { iframe.focus(); return true; }
     return false;
@@ -286,7 +243,7 @@
     if (parts.includes("ctrl") || parts.includes("control")) mods |= 2;
     if (parts.includes("meta") || parts.includes("win") || parts.includes("super")) mods |= 4;
     if (parts.includes("shift")) mods |= 8;
-    
+
     const reserved = ["ctrl","control","alt","shift","win","meta","super"];
     const key = parts.find(p => !reserved.includes(p)) || parts[parts.length - 1];
     return { key, mods };
@@ -294,17 +251,16 @@
 
   // ─── Text Injection ──────────────────────────────────────────────────────────
   async function typeTextNatively(text) {
-    sendStatus(`Native typing: "${text.slice(0, 50)}"`, "info");
+    sendStatus(`Native typing: "${text.slice(0, 60)}"`, "info");
     focusVM();
     await delay(300);
     for (const char of text) {
       if (stopRequested) break;
       await sendNativeKey(char, 0, char);
-      await delay(30); // small delay between keystrokes
+      await delay(30);
     }
     return true;
   }
-
 
   // ─── AI Integration ─────────────────────────────────────────────────────────
   function askAI(prompt, imageBase64 = null) {
@@ -328,34 +284,102 @@
     return new Promise(resolve => {
       chrome.runtime.sendMessage({ type: "CAPTURE_SCREEN" }, resp => {
         if (chrome.runtime.lastError || !resp || resp.error) {
-           resolve(null);
+          resolve(null);
         } else {
-           resolve(resp.imageBase64);
+          resolve(resp.imageBase64);
         }
       });
     });
   }
 
-  function buildActionsPrompt(stepText, labContext) {
+  function stripJSON(raw) {
+    if (!raw) return "";
+    return raw.replace(/^```[\w]*\r?\n?/, "").replace(/\r?\n?```\s*$/, "").trim();
+  }
+
+  // ─── Phase 0 Prompt: Read the Entire Task First ──────────────────────────────
+  function buildReadTaskPrompt(allInstructions, labContext) {
+    return `You are an automation agent for Cengage MindTap virtual cybersecurity labs (${labContext}).
+
+## PHASE 0 — READ THE ENTIRE TASK FIRST
+
+Before performing any action you must:
+1. Read the complete task/instructions below.
+2. Identify every numbered step, sub-step, command, script, configuration, test, and verification requirement.
+3. Determine which environment each step targets: Kali Linux, Windows, Browser, Network device, or other VM.
+4. Create a numbered checklist of every required action.
+5. Identify any scripts that need to be located and run.
+6. Note every value that must be entered exactly (IP addresses, ports, usernames, file paths, URLs, passwords).
+
+Full lab instructions:
+"""
+${allInstructions}
+"""
+
+Return ONLY a valid JSON object. Do NOT use markdown fences.
+{
+  "summary": "One-sentence description of what this lab does",
+  "context": "Kali Linux | Windows Server 2022 | Windows 10 | Mixed | etc.",
+  "checklist": [
+    "[ ] Step 1: description",
+    "[ ] Step 2: description"
+  ],
+  "critical_values": {
+    "note": "Any exact IP addresses, passwords, file paths, commands from the instructions"
+  },
+  "first_actions": [
+    {"type":"focus_vm"},
+    {"type":"type_text","value":"ls -la"}
+  ]
+}`;
+  }
+
+  // ─── Per-Step Agent Prompt ───────────────────────────────────────────────────
+  function buildStepPrompt(stepText, labContext, checklist, previousErrorReason) {
+    const errorSection = previousErrorReason
+      ? `\n## Previous Attempt Failed\nError reason from last iteration: "${previousErrorReason}"\nYou must diagnose why that failed and take a different action to resolve it.\n`
+      : "";
+
+    const checklistText = checklist.length > 0
+      ? checklist.join("\n")
+      : "(No checklist yet — this may be the first step)";
+
     return `You are an automation agent for Cengage MindTap virtual cybersecurity labs.
-Your primary goal is to complete the assigned virtual lab as fully as possible before submission. Do not simply explain what the student should do. You must perform the required actions inside the provided virtual environment whenever the environment allows it.
 
-## 1. Execute Instead of Explaining
-For every instruction that requires an action:
-- Execute the commands.
-- Observe the output.
-- Verify that the expected result occurred.
+Your primary goal is to COMPLETE the assigned virtual lab as fully as possible before submission.
+Do NOT explain what the student should do — actually PERFORM the required actions.
 
-## 2. Verification
-Observe stdout/stderr and exit status. Check whether files were created or modified. 
-If a command returns an error, identify the cause, correct the issue, re-run, and verify.
-Do not mark a task as complete just because the command was entered.
+## The Persona You Must Follow
 
-## 3. Maintain a Completion Checklist
-Internally maintain a checklist. A step may only receive a ✓ when its result has been verified.
+### Execute Instead of Explaining
+For every instruction: Open the application → Navigate → Enter commands → Execute → Wait → Observe output → Verify → Continue.
+NEVER type a command without following up with Enter and then checking the result in the next iteration.
 
-## 4. Final State
-At the end of the lab or step, provide a concise completion report.
+### Verification
+After running a command, the NEXT screenshot will show the output. Read stdout/stderr carefully.
+- Check exit status patterns: prompt reappearing = success, error messages = failure.
+- Use these verification commands when appropriate (Kali): echo $?, ls -la, ip addr, ps aux, ss -tulpn
+- Use these verification commands when appropriate (Windows/PS): ipconfig /all, Get-Service, Get-Process, Get-ChildItem
+
+### Handle Errors Properly
+If a command fails:
+1. Read the error carefully.
+2. Identify the cause: wrong directory, wrong syntax, missing package, permission, service not running.
+3. Fix the issue.
+4. Re-run the original command.
+5. Verify the result.
+Do NOT repeat a failing command without first diagnosing why it failed.
+
+### Do Not Skip Small Steps
+Every step matters: cd commands, mkdir, chmod, service starts/stops, saving files, confirming dialogs.
+
+### Maintain Completion Checklist
+A step only gets [✓] when you have SEEN the expected result in a screenshot.
+
+### Do Not Mark Complete Prematurely
+Only set status "complete" when you have visually verified the expected outcome on screen.
+${errorSection}
+---
 
 Lab context: ${labContext}
 
@@ -364,84 +388,100 @@ Current step instructions:
 ${stepText}
 """
 
-You are provided with a screenshot of the current VM state. 
+Current checklist state:
+${checklistText}
 
-Action types available:
-- {"type":"focus_vm"} — focus the VM window before typing
-- {"type":"type_text","value":"text"} — type text into VM (uses native keystrokes).
-- {"type":"key","value":"Enter"} — single key press (e.g. Enter, Tab, Escape)
-- {"type":"shortcut","value":"ctrl+v"} — keyboard shortcut
-- {"type":"win_run","value":"cmd.exe"} — open Win+R Run dialog and run command
-- {"type":"wait","value":2000} — wait N milliseconds
+A screenshot of the current VM state is attached. Analyze it carefully before deciding what to do.
 
-Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown blocks.
+## Available Actions
+- {"type":"focus_vm"} — focus the VM window before typing (always first)
+- {"type":"type_text","value":"text"} — type text into VM via native keystrokes
+- {"type":"key","value":"Enter"} — single key: Enter, Tab, Escape, Space, Backspace, Delete, F1-F12, ArrowUp/Down/Left/Right, Home, End
+- {"type":"shortcut","value":"ctrl+c"} — keyboard shortcut
+- {"type":"win_run","value":"cmd.exe","waitAfter":3000} — Win+R run dialog
+- {"type":"wait","value":2000} — wait N ms (always add after win_run and slow operations)
+
+## Common Mappings (Windows)
+- Windows Defender Firewall → win_run "wf.msc"
+- Computer Management → win_run "compmgmt.msc"
+- Server Manager → win_run "ServerManager.exe"
+- Active Directory Users → win_run "dsa.msc"
+- Group Policy Management → win_run "gpmc.msc"
+- Registry Editor → win_run "regedit.exe"
+- Command Prompt (admin) → shortcut "win+x" then type_text "a"
+- PowerShell → win_run "powershell.exe"
+- Task Manager → shortcut "ctrl+shift+esc"
+- Login screen → shortcut "ctrl+alt+delete", then type password + Enter
+
+## Rules
+- Always start actions with focus_vm
+- After win_run, always add wait 3000+
+- After app opens, add wait 2000 before interacting
+- After typing a command in terminal, always add {"type":"key","value":"Enter"} then {"type":"wait","value":2000}
+- After waiting, the NEXT iteration will screenshot and verify the result
+
+Return ONLY a valid JSON object. Do NOT use markdown fences.
 {
-  "thought": "Your reasoning about the current screen and what to do next to verify or progress",
-  "checklist": ["[✓] Step 1 completed and verified", "[ ] Step 2 not completed"],
-  "actions": [ {"type":"type_text","value":"ls -la"}, {"type":"key","value":"Enter"} ],
+  "thought": "Detailed analysis of the screenshot and reasoning for next actions",
+  "checklist": ["[✓] Step X: verified description", "[ ] Step Y: pending"],
+  "actions": [
+    {"type":"focus_vm"},
+    {"type":"type_text","value":"ls -la"},
+    {"type":"key","value":"Enter"},
+    {"type":"wait","value":2000}
+  ],
   "status": "in_progress",
-  "report": "Final completion report (only when status is complete)"
+  "error_reason": "",
+  "report": ""
+}
+
+Status values:
+- "in_progress" — still working, loop will re-screenshot and come back
+- "verify_only" — no new actions needed, just take a screenshot to see the result of previous actions
+- "complete" — step fully done AND verified by observing the expected output in the screenshot
+- "error" — encountered an unrecoverable error (explain in error_reason)`;
+  }
+
+  // ─── Phase 3 Pre-Submission Review Prompt ──────────────────────────────────
+  function buildPreSubmitPrompt(allInstructions, finalChecklist, labContext) {
+    return `You are an automation agent completing a final pre-submission review of a Cengage MindTap cybersecurity lab (${labContext}).
+
+## PHASE 3 — VERIFICATION BEFORE SUBMISSION
+
+Compare what was accomplished against EVERY instruction.
+
+Full lab instructions:
+"""
+${allInstructions}
+"""
+
+Final checklist state:
+${finalChecklist.join("\n")}
+
+A screenshot of the current VM state is attached.
+
+Check:
+- Every command executed and verified
+- Every script executed and verified
+- Every configuration completed
+- Every required file created/modified
+- Every required scan/test performed
+- Every required value entered correctly
+- Every required output obtained
+- All questions/tasks completed
+
+Return ONLY a valid JSON object. Do NOT use markdown fences.
+{
+  "lab_status": "COMPLETE or PARTIALLY_COMPLETE",
+  "completed_items": ["Item 1", "Item 2"],
+  "verified_items": ["Command results", "Configuration"],
+  "remaining_items": ["None" or list of incomplete items],
+  "safe_to_submit": true,
+  "final_report": "LAB STATUS: COMPLETE\\n\\nCompleted:\\n- Step 1\\n- Step 2\\n\\nVerified:\\n- Results\\n\\nRemaining:\\n- None"
 }`;
   }
 
-  async function executeStepLoop(stepText, labContext) {
-    let iterations = 0;
-    const MAX_ITERATIONS = 12;
-    
-    while (iterations < MAX_ITERATIONS && isRunning && !stopRequested) {
-      iterations++;
-      sendStatus(`Verification Loop ${iterations}/${MAX_ITERATIONS}...`, "info");
-      
-      const screenshot = await getScreenshot();
-      if (!screenshot) {
-        sendStatus("Failed to capture screenshot. Retrying...", "warn");
-        await delay(2000);
-        continue;
-      }
-
-      const prompt = buildActionsPrompt(stepText, labContext);
-      const raw = await askAI(prompt, screenshot);
-      if (!raw) return false;
-      
-      const cleaned = raw.replace(/^```[\w]*\r?\n?/, "").replace(/\r?\n?```\s*$/, "").trim();
-      let aiResponse;
-      try {
-        aiResponse = JSON.parse(cleaned);
-      } catch (_) {
-        sendStatus("AI response was not valid JSON — retrying...", "warn");
-        await delay(2000);
-        continue;
-      }
-      
-      if (aiResponse.thought) sendStatus(`AI: ${aiResponse.thought.slice(0, 100)}...`, "info");
-      if (aiResponse.checklist) console.log("[Checklist]", aiResponse.checklist);
-      
-      if (aiResponse.actions && aiResponse.actions.length > 0) {
-        dispatchActions(aiResponse.actions);
-        const totalWait = aiResponse.actions.reduce((acc, a) => {
-           if (a.type === 'wait') return acc + Number(a.value || 1000);
-           if (a.type === 'win_run') return acc + 2500 + Number(a.waitAfter || 3000);
-           if (a.type === 'type_text') return acc + 1000 + currentSpeed * 0.3;
-           return acc + 600;
-        }, 0);
-        await delay(totalWait + 3000); // Wait for actions + give screen time to update
-      }
-      
-      if (aiResponse.status === "complete") {
-        sendStatus("AI marked step as COMPLETE.", "success");
-        return true;
-      }
-      if (aiResponse.status === "error") {
-        sendStatus("AI reported an error it cannot fix.", "error");
-        return false;
-      }
-      
-      await delay(1000);
-    }
-    return false;
-  }
-
-  // ─── Execute Actions ────────────────────────────────────────────────────────
+  // ─── Action Executor ─────────────────────────────────────────────────────────
   async function executeAction(action) {
     if (stopRequested) return;
     switch (action.type) {
@@ -479,16 +519,11 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
         sendStatus(`Win+R → ${cmd}`, "info");
         focusVM();
         await delay(300);
-        
-        // Open Run dialog (Win+R) - Meta = 4
-        await sendNativeKey("r", 4);
-        await delay(1500); // Wait for Run dialog to appear
-        
-        // Type command and press Enter
+        await sendNativeKey("r", 4); // Win+R (Meta=4)
+        await delay(1500);
         await typeTextNatively(cmd);
         await delay(300);
         await sendNativeKey("Enter");
-        
         await delay(action.waitAfter || 3000);
         break;
       }
@@ -513,11 +548,19 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
   }
 
   // ─── Cross-Frame Execution ──────────────────────────────────────────────────
-  function dispatchActions(actions) {
+  function dispatchActionsToVM(actions) {
     if (!actions || actions.length === 0) return;
-    // We send to background, which broadcasts to ALL frames in the active tab
-    // So the frame holding the VM canvas will catch it and execute
     chrome.runtime.sendMessage({ type: "VM_ACTION", actions });
+  }
+
+  // Estimate how long a set of actions will take to execute
+  function estimateWait(actions) {
+    return actions.reduce((acc, a) => {
+      if (a.type === "wait") return acc + Number(a.value || 1000);
+      if (a.type === "win_run") return acc + 1500 + Number(a.waitAfter || 3000);
+      if (a.type === "type_text") return acc + (String(a.value || "").length * 35) + 500;
+      return acc + 500;
+    }, 0);
   }
 
   // ─── Navigation ─────────────────────────────────────────────────────────────
@@ -527,7 +570,7 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
       try {
         const btn = document.querySelector(sel);
         if (btn && !btn.disabled && isVisible(btn)) {
-          sendStatus(`Clicking Next: "${btn.innerText?.trim().slice(0,30) || btn.className}"`, "info");
+          sendStatus(`Clicking Next: "${btn.innerText?.trim().slice(0, 30) || btn.className}"`, "info");
           btn.scrollIntoView({ behavior: "smooth", block: "center" });
           await delay(300);
           btn.click();
@@ -536,7 +579,7 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
         }
       } catch (_) {}
     }
-    // Text scan fallback
+    // Text-scan fallback
     const allBtns = [...document.querySelectorAll("button, [role='button'], a")];
     for (const btn of allBtns) {
       const text = (btn.innerText || btn.getAttribute("aria-label") || "").trim().toLowerCase();
@@ -551,13 +594,17 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
     return false;
   }
 
-  // ─── Verification ────────────────────────────────────────────────────────────
+  // ─── Verify Button & Result ────────────────────────────────────────────────
   async function clickVerify() {
     const allBtns = [...document.querySelectorAll("button, [role='button'], a")];
     for (const btn of allBtns) {
       const text = (btn.innerText || btn.getAttribute("aria-label") || "").trim().toLowerCase();
-      if ((text === "verify" || text === "check work" || text === "verify work") && isVisible(btn) && !btn.disabled) {
-        sendStatus("Clicking Verify...", "info");
+      if (
+        (text === "verify" || text === "check work" || text === "verify work" ||
+         text === "check answer" || text === "submit" || text === "check") &&
+        isVisible(btn) && !btn.disabled
+      ) {
+        sendStatus("Clicking Verify/Check...", "info");
         btn.scrollIntoView({ behavior: "smooth", block: "center" });
         await delay(300);
         btn.click();
@@ -568,24 +615,18 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
   }
 
   function checkVerificationPassed() {
-    // Check if there's a visible error message
     const bodyText = document.body.innerText.toLowerCase();
-    if (bodyText.includes("verification failed") || 
-        bodyText.includes("not complete") || 
-        bodyText.includes("did not pass")) {
+    if (
+      bodyText.includes("verification failed") ||
+      bodyText.includes("not complete") ||
+      bodyText.includes("did not pass") ||
+      bodyText.includes("incorrect")
+    ) {
       return false;
     }
-    
-    // Check checkboxes. Cengage/LOD lists tasks with checkboxes.
-    // If they aren't checked, the verification failed.
     const checkboxes = [...document.querySelectorAll("input[type='checkbox']")];
-    const visibleCheckboxes = checkboxes.filter(cb => isVisible(cb));
-    if (visibleCheckboxes.length > 0) {
-      // If any visible checkbox is not checked, verification isn't complete
-      const allChecked = visibleCheckboxes.every(cb => cb.checked);
-      if (!allChecked) return false;
-    }
-    
+    const visible = checkboxes.filter(cb => isVisible(cb));
+    if (visible.length > 0 && !visible.every(cb => cb.checked)) return false;
     return true;
   }
 
@@ -601,7 +642,7 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
   }
 
   function detectLabContext() {
-    const text = (document.title + " " + document.body.innerText.slice(0, 600)).toLowerCase();
+    const text = (document.title + " " + document.body.innerText.slice(0, 800)).toLowerCase();
     if (text.includes("kali")) return "Kali Linux";
     if (text.includes("ubuntu") || text.includes("debian")) return "Ubuntu Linux";
     if (text.includes("server 2022")) return "Windows Server 2022";
@@ -612,7 +653,192 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
     if (text.includes("active directory") || text.includes("domain controller")) return "Windows Server Active Directory lab";
     if (text.includes("firewall") || text.includes("defender")) return "Windows Server with Windows Defender Firewall";
     if (text.includes("iis") || text.includes("web server")) return "Windows Server IIS Web Server lab";
+    if (text.includes("metasploit") || text.includes("nmap") || text.includes("wireshark")) return "Kali Linux cybersecurity lab";
     return "Windows Server lab";
+  }
+
+  // ─── Phase 0: Read Entire Task ──────────────────────────────────────────────
+  async function readEntireTask(labContext) {
+    sendStatus("📋 Phase 0: Reading entire task first...", "info");
+    const allText = getAllInstructionsText();
+    if (!allText || allText.length < 30) {
+      sendStatus("Could not read task instructions — skipping Phase 0.", "warn");
+      return [];
+    }
+
+    fullTaskText = allText;
+    sendStatus(`Task text captured (${allText.length} chars). Sending to AI...`, "info");
+
+    const screenshot = await getScreenshot();
+    const prompt = buildReadTaskPrompt(allText, labContext);
+    const raw = await askAI(prompt, screenshot);
+    if (!raw) {
+      sendStatus("AI did not respond during Phase 0.", "warn");
+      return [];
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(stripJSON(raw));
+    } catch (_) {
+      sendStatus("Phase 0 AI response was not valid JSON — continuing without checklist.", "warn");
+      return [];
+    }
+
+    if (parsed.summary) sendStatus(`Lab summary: ${parsed.summary}`, "info");
+    if (parsed.checklist) {
+      globalChecklist = parsed.checklist;
+      sendStatus(`Checklist built: ${globalChecklist.length} items.`, "info");
+      console.log("[VM-Automator][Checklist]", globalChecklist);
+    }
+    if (parsed.critical_values) {
+      sendStatus(`Critical values noted: ${JSON.stringify(parsed.critical_values)}`, "info");
+    }
+
+    // Execute any "first_actions" the AI suggests (e.g., click Start, dismiss dialog)
+    if (parsed.first_actions && Array.isArray(parsed.first_actions) && parsed.first_actions.length > 0) {
+      sendStatus("Executing Phase 0 first actions...", "info");
+      dispatchActionsToVM(parsed.first_actions);
+      await delay(estimateWait(parsed.first_actions) + 2000);
+    }
+
+    return globalChecklist;
+  }
+
+  // ─── Per-Step Verification Loop ─────────────────────────────────────────────
+  async function executeStepLoop(stepText, labContext) {
+    const MAX_ITERATIONS = 16;
+    let iterations = 0;
+    let previousErrorReason = "";
+    let consecutiveVerifyOnly = 0;
+
+    while (iterations < MAX_ITERATIONS && isRunning && !stopRequested) {
+      iterations++;
+      sendStatus(`🔁 Iteration ${iterations}/${MAX_ITERATIONS} — capturing screen...`, "info");
+
+      const screenshot = await getScreenshot();
+      if (!screenshot) {
+        sendStatus("Screenshot failed — retrying...", "warn");
+        await delay(2000);
+        continue;
+      }
+
+      const prompt = buildStepPrompt(stepText, labContext, globalChecklist, previousErrorReason);
+      previousErrorReason = ""; // reset
+
+      const raw = await askAI(prompt, screenshot);
+      if (!raw) {
+        sendStatus("AI returned empty response — retrying...", "warn");
+        await delay(3000);
+        continue;
+      }
+
+      let ai;
+      try {
+        ai = JSON.parse(stripJSON(raw));
+      } catch (_) {
+        sendStatus("AI response was not valid JSON — retrying...", "warn");
+        await delay(2000);
+        continue;
+      }
+
+      // Log thought
+      if (ai.thought) {
+        sendStatus(`💭 ${ai.thought.slice(0, 120)}`, "info");
+        console.log("[VM-Automator][Thought]", ai.thought);
+      }
+
+      // Update global checklist
+      if (ai.checklist && Array.isArray(ai.checklist) && ai.checklist.length > 0) {
+        globalChecklist = ai.checklist;
+        console.log("[VM-Automator][Checklist]", globalChecklist);
+        const done = globalChecklist.filter(i => i.startsWith("[✓]")).length;
+        sendStatus(`Checklist: ${done}/${globalChecklist.length} done`, "info");
+      }
+
+      // Execute actions
+      if (ai.actions && ai.actions.length > 0 && ai.status !== "verify_only") {
+        sendStatus(`▶ Executing ${ai.actions.length} action(s)...`, "info");
+        dispatchActionsToVM(ai.actions);
+        const waitMs = estimateWait(ai.actions) + 2500;
+        sendStatus(`⏳ Waiting ${Math.round(waitMs / 1000)}s for VM to update...`, "info");
+        await delay(waitMs);
+      }
+
+      // Handle status
+      if (ai.status === "complete") {
+        if (ai.report) sendStatus(`✅ ${ai.report.slice(0, 200)}`, "success");
+        else sendStatus("✅ AI confirmed step COMPLETE.", "success");
+        return true;
+      }
+
+      if (ai.status === "verify_only") {
+        // AI wants to look at the output without acting
+        consecutiveVerifyOnly++;
+        sendStatus("👁 Verify-only iteration — re-screenshotting...", "info");
+        await delay(1500);
+        if (consecutiveVerifyOnly >= 4) {
+          // Stuck in verify loop — treat as complete and move on
+          sendStatus("Verify-only loop detected — treating step as complete.", "warn");
+          return true;
+        }
+        continue;
+      }
+      consecutiveVerifyOnly = 0;
+
+      if (ai.status === "error") {
+        if (ai.error_reason) {
+          sendStatus(`⚠ AI error: ${ai.error_reason}`, "warn");
+          previousErrorReason = ai.error_reason;
+          // We do NOT stop — we loop back and let the AI try to diagnose
+          await delay(2000);
+          continue;
+        } else {
+          sendStatus("AI reported unrecoverable error.", "error");
+          return false;
+        }
+      }
+
+      // Default: in_progress — loop again
+      await delay(1000);
+    }
+
+    sendStatus(`Max iterations (${MAX_ITERATIONS}) reached for this step.`, "warn");
+    return false;
+  }
+
+  // ─── Phase 3: Pre-Submission Review ─────────────────────────────────────────
+  async function preSubmitReview(labContext) {
+    sendStatus("🔍 Phase 3: Pre-submission review...", "info");
+    if (!fullTaskText) {
+      sendStatus("No full task text cached — skipping pre-submission review.", "warn");
+      return true;
+    }
+
+    const screenshot = await getScreenshot();
+    const prompt = buildPreSubmitPrompt(fullTaskText, globalChecklist, labContext);
+    const raw = await askAI(prompt, screenshot);
+    if (!raw) { sendStatus("AI review failed — proceeding anyway.", "warn"); return true; }
+
+    let review;
+    try {
+      review = JSON.parse(stripJSON(raw));
+    } catch (_) {
+      sendStatus("Pre-submit AI response not valid JSON — proceeding.", "warn");
+      return true;
+    }
+
+    if (review.final_report) {
+      sendStatus(`📊 ${review.final_report.slice(0, 300)}`, review.lab_status === "COMPLETE" ? "success" : "warn");
+      console.log("[VM-Automator][Final Report]", review.final_report);
+    }
+
+    if (review.remaining_items && review.remaining_items.length > 0 &&
+        !review.remaining_items.every(i => i.toLowerCase() === "none")) {
+      sendStatus(`⚠ Incomplete items: ${review.remaining_items.join("; ")}`, "warn");
+    }
+
+    return review.safe_to_submit !== false;
   }
 
   // ─── Master Loop ─────────────────────────────────────────────────────────────
@@ -620,36 +846,49 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
     if (isRunning) { sendStatus("Already running.", "warn"); return; }
     isRunning = true;
     stopRequested = false;
-    sendStatus("🖥️ VM Lab automation starting...", "info");
+    globalChecklist = [];
+    fullTaskText = "";
+
+    sendStatus("🖥️ VM Lab automation starting (v3.0 — Full Agent Mode)...", "info");
     await delay(currentSpeed);
 
     const labContext = detectLabContext();
-    sendStatus(`Lab context detected: ${labContext}`, "info");
+    sendStatus(`Lab context: ${labContext}`, "info");
+
+    // Phase 0: Read entire task first
+    await readEntireTask(labContext);
+    if (stopRequested) { isRunning = false; return; }
 
     let stepCount = 0;
     const MAX_STEPS = 80;
     let lastStepText = "";
     let sameStepCount = 0;
 
+    // Phase 1 & 2: Step loop
     while (isRunning && !stopRequested && stepCount < MAX_STEPS) {
       stepCount++;
-      if (isLabComplete()) { sendStatus("🎉 Lab complete!", "success"); break; }
+
+      if (isLabComplete()) {
+        sendStatus("🎉 Lab complete detected!", "success");
+        break;
+      }
 
       const stepText = getCurrentStepText();
-      
-      // If we found NO instructions, this frame might just be the canvas frame.
-      // We shouldn't spam "No instruction found" unless we were previously finding them.
+
       if (!stepText) {
         if (stepCount === 1) {
-           // We are not the master frame (likely the canvas frame). Just wait.
-           // We will act when we receive VM_ACTION messages.
-           sendStatus("Acting as Canvas node (no instructions found here)", "info");
-           return; 
+          // This frame is the canvas frame — just wait for VM_ACTION messages
+          sendStatus("Acting as Canvas node (no instructions found here)", "info");
+          isRunning = false;
+          return;
         }
         sendStatus("No step instruction found — waiting...", "warn");
         await delay(3000);
         sameStepCount++;
-        if (sameStepCount >= 4) { sendStatus("No instructions found — stopping.", "error"); break; }
+        if (sameStepCount >= 5) {
+          sendStatus("No instructions found after 5 attempts — stopping.", "error");
+          break;
+        }
         continue;
       }
 
@@ -658,10 +897,11 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
       if (stepText === lastStepText) {
         sameStepCount++;
         if (sameStepCount >= 4) {
-          sendStatus("Step stuck after 4 attempts — trying Next anyway.", "warn");
+          sendStatus("Step text unchanged after 4 loops — clicking Next to advance.", "warn");
           const advanced = await clickNext();
           if (!advanced) { sendStatus("Cannot advance — stopping.", "error"); break; }
           sameStepCount = 0;
+          lastStepText = "";
           await delay(currentSpeed);
           continue;
         }
@@ -672,54 +912,73 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
 
       sameStepCount = 0;
       lastStepText = stepText;
-      sendStatus(`Step ${stepCount}: "${stepText.slice(0, 90)}..."`, "info");
+      sendStatus(`📍 Step ${stepCount}: "${stepText.slice(0, 80)}..."`, "info");
 
-      sendStatus("Asking AI for actions...", "info");
-      
+      // Phase 1: Execute step with visual verification loop
       const stepSuccess = await executeStepLoop(stepText, labContext);
       if (stopRequested) break;
 
       if (!stepSuccess) {
-        sendStatus("AI could not complete step.", "warn");
-      } else {
-        // ── Check for Verify Button ──
-        const clickedVerify = await clickVerify();
-        if (clickedVerify) {
-           sendStatus("Waiting for verification tests to run...", "info");
-           await delay(6000); // LOD takes a few seconds to run scripts
-           
-           const passed = checkVerificationPassed();
-           if (!passed) {
-              sendStatus("Verification FAILED! Automation stopped so you can fix it.", "error");
-              break;
-           }
-           sendStatus("Verification PASSED!", "success");
-        }
-
-        await delay(currentSpeed * 0.5);
+        sendStatus("AI could not complete step — attempting to advance anyway.", "warn");
       }
 
+      // Phase 2: Click Verify if present
+      const clickedVerify = await clickVerify();
+      if (clickedVerify) {
+        sendStatus("Waiting for LOD verification scripts to run...", "info");
+        await delay(7000);
+        const passed = checkVerificationPassed();
+        if (!passed) {
+          sendStatus("⛔ Verification FAILED — stopping so you can review.", "error");
+          isRunning = false;
+          return;
+        }
+        sendStatus("✅ Verification PASSED!", "success");
+      }
+
+      await delay(currentSpeed * 0.5);
+
+      // Advance to next step
       await clickNext();
       await delay(currentSpeed);
     }
 
+    // Phase 3: Pre-submission review
+    if (!stopRequested && !isLabComplete()) {
+      await preSubmitReview(labContext);
+    }
+
     if (stepCount >= MAX_STEPS) sendStatus("Max steps reached.", "warn");
     isRunning = false;
-    sendStatus("VM lab automation ended.", "info");
+    sendStatus("🏁 VM lab automation ended.", "info");
   }
 
+  // ─── Single Step Mode ────────────────────────────────────────────────────────
   async function stepOnceVM() {
     const labContext = detectLabContext();
     const stepText = getCurrentStepText();
-    if (!stepText) { 
-        // Silent if canvas node
-        return; 
+    if (!stepText) {
+      // Likely the canvas frame — silent exit
+      return;
     }
-    sendStatus(`Single step: "${stepText.slice(0, 90)}"`, "info");
+    sendStatus(`▶ Single step: "${stepText.slice(0, 80)}"`, "info");
+
     const success = await executeStepLoop(stepText, labContext);
     if (!success) {
       sendStatus("AI could not complete this step.", "warn");
+      return;
     }
+
+    // Click verify if available
+    const clickedVerify = await clickVerify();
+    if (clickedVerify) {
+      sendStatus("Waiting for verification...", "info");
+      await delay(6000);
+      const passed = checkVerificationPassed();
+      sendStatus(passed ? "✅ Verification PASSED!" : "⛔ Verification FAILED!", passed ? "success" : "error");
+    }
+
+    await clickNext();
   }
 
   // ─── Message Handler ─────────────────────────────────────────────────────────
@@ -741,10 +1000,9 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
       sendResponse({ ok: true });
     }
     if (msg.type === "VM_ACTION") {
-      // If we receive this message, check if we have the VM canvas.
-      // Only the frame with the VM canvas should execute keyboard/paste actions.
+      // Only the frame with the VM canvas executes keyboard actions
       if (getVMCanvas() || document.querySelector("iframe")) {
-         executeActionsLocally(msg.actions);
+        executeActionsLocally(msg.actions);
       }
     }
     if (msg.type === "PING") {
@@ -753,6 +1011,6 @@ Return ONLY a valid JSON object matching this schema. Do NOT wrap in markdown bl
     return true;
   });
 
-  sendStatus("🖥️ VM Lab Automator loaded. Open the extension popup to start.", "info");
+  sendStatus("🖥️ VM Lab Automator v3.0 loaded — open the popup to start.", "info");
 
 })();
