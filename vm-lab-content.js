@@ -1336,8 +1336,15 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
     return true;
   });
 
-  // Announce load from ALL frames so we can see injection in devtools;
-  // status goes to background but duplicate suppression is handled by the master lock.
+  // ── Self-register with the background so it knows this frame's frameId ──────
+  // chrome.tabs.sendMessage cannot target a cross-origin iframe by frameId from
+  // outside. But the background CAN send TO a frame if it already knows the frameId
+  // from a prior message. We register on load so POPUP_BROADCAST can reach us.
+  chrome.runtime.sendMessage({
+    type: "FRAME_REGISTER",
+    url: location.href.slice(0, 100)
+  }, () => { void chrome.runtime.lastError; }); // ignore if bg not ready
+
   sendStatus(`🖥️ VM Lab Automator v3.0 loaded (frame: ${location.href.slice(0, 60)}) — open popup to start.`, "info");
 
 })();

@@ -23,35 +23,70 @@ const PROVIDERS = {
   }
 };
 
+// ─── Frame Registry ───────────────────────────────────────────────────────────
+// Cross-origin iframes can't be reached by chrome.tabs.sendMessage unless we
+// know their frameId. Content scripts register themselves here on load.
+// Key: tabId, Value: Set of {frameId, url}
+const frameRegistry = new Map();
+
+chrome.tabs.onRemoved.addListener((tabId) => frameRegistry.delete(tabId));
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === "loading") frameRegistry.delete(tabId);
+});
+
 // ─── Message Router ───────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+
+  // ── Frame self-registration ───────────────────────────────────────────────
+  if (msg.type === "FRAME_REGISTER" && sender.tab) {
+    const tabId = sender.tab.id;
+    const frameId = sender.frameId ?? 0;
+    if (!frameRegistry.has(tabId)) frameRegistry.set(tabId, new Map());
+    frameRegistry.get(tabId).set(frameId, msg.url || "");
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  // ── POPUP_BROADCAST — send to all registered frames in a tab ─────────────
+  if (msg.type === "POPUP_BROADCAST") {
+    const { tabId, payload } = msg;
+    if (!tabId || !payload) { sendResponse({ error: "missing tabId or payload" }); return false; }
+
+    const frames = frameRegistry.get(tabId);
+    if (!frames || frames.size === 0) {
+      // No registered frames — fall back to broadcast (may only hit top frame)
+      chrome.tabs.sendMessage(tabId, payload, (resp) => {
+        if (chrome.runtime.lastError || !resp) {
+          sendResponse({ error: "no registered frames and broadcast failed" });
+        } else {
+          sendResponse(resp);
+        }
+      });
+      return true;
+    }
+
+    // Send to ALL registered frames, resolve with first successful response
+    let resolved = false;
+    let pending = frames.size;
+    for (const [frameId] of frames) {
+      chrome.tabs.sendMessage(tabId, payload, { frameId }, (resp) => {
+        pending--;
+        if (!resolved && !chrome.runtime.lastError && resp) {
+          resolved = true;
+          sendResponse(resp);
+        } else if (!resolved && pending === 0) {
+          sendResponse({ error: "all registered frames failed to respond" });
+        }
+      });
+    }
+    return true;
+  }
 
   // ── AI Request ────────────────────────────────────────────────────────────
   if (msg.type === "ASK_AI") {
     handleAI(msg.prompt, msg.apiKey, msg.imageBase64, msg.provider, msg.model)
       .then(sendResponse);
     return true;
-  }
-
-  // ── POPUP_BROADCAST — relay popup command to all frames in a tab ─────────
-  // Direct chrome.tabs.sendMessage from the popup only reliably hits the top frame.
-  // From the background service worker we can broadcast to all frames.
-  // On LOD pages the relevant frames are sub-frames (VirtualizationClient, instructions),
-  // so we send to ALL frames and take the first successful response.
-  if (msg.type === "POPUP_BROADCAST") {
-    const { tabId, payload } = msg;
-    if (!tabId || !payload) { sendResponse({ error: "missing tabId or payload" }); return false; }
-
-    // Broadcast to ALL frames in the tab (background can reach cross-origin frames
-    // that loaded via content_scripts manifest declaration).
-    chrome.tabs.sendMessage(tabId, payload, (resp) => {
-      if (chrome.runtime.lastError || !resp) {
-        sendResponse({ error: chrome.runtime.lastError?.message || "no frame responded" });
-      } else {
-        sendResponse(resp);
-      }
-    });
-    return true; // async
   }
 
   // ── Settings fetch ────────────────────────────────────────────────────────
