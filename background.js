@@ -1,35 +1,51 @@
 // background.js — Service Worker (MV3)
-// Handles Gemini AI calls (avoids CORS issues in content scripts).
+// Handles AI calls for multiple providers (Gemini, OpenAI, OpenRouter).
+// Avoids CORS issues in content scripts.
 // Relays STATUS_UPDATE messages from content scripts to the popup.
 
-const GEMINI_ENDPOINT =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+const PROVIDERS = {
+  gemini: {
+    // Model updated to gemini-2.5-flash (gemini-2.0-flash was deprecated Sep 2026)
+    endpoint: (model) =>
+      `https://generativelanguage.googleapis.com/v1beta/models/${model || "gemini-2.5-flash"}:generateContent`,
+    defaultModel: "gemini-2.5-flash",
+    fallbackModels: ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"]
+  },
+  openai: {
+    endpoint: () => "https://api.openai.com/v1/chat/completions",
+    defaultModel: "gpt-4o-mini",
+    fallbackModels: ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"]
+  },
+  openrouter: {
+    endpoint: () => "https://openrouter.ai/api/v1/chat/completions",
+    defaultModel: "openai/gpt-4o-mini",
+    fallbackModels: ["openai/gpt-4o-mini", "google/gemini-2.5-flash", "anthropic/claude-3-haiku"]
+  }
+};
 
 // ─── Message Router ───────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
-  // ── AI Request (from any content script) ──────────────────────────────────
+  // ── AI Request ────────────────────────────────────────────────────────────
   if (msg.type === "ASK_AI") {
-    handleAI(msg.prompt, msg.apiKey, msg.imageBase64).then(sendResponse);
-    return true; // keep channel open for async response
+    handleAI(msg.prompt, msg.apiKey, msg.imageBase64, msg.provider, msg.model)
+      .then(sendResponse);
+    return true;
   }
 
   // ── Settings fetch ────────────────────────────────────────────────────────
   if (msg.type === "GET_SETTINGS") {
-    chrome.storage.sync.get(["apiKey", "speed", "enabled"], (data) => sendResponse(data));
+    chrome.storage.sync.get(
+      ["apiKey", "openaiKey", "openrouterKey", "provider", "model", "speed", "enabled"],
+      (data) => sendResponse(data)
+    );
     return true;
   }
 
   // ── CLIPBOARD_WRITE fallback ───────────────────────────────────────────────
-  // Content scripts in cross-origin iframes can't always access the Clipboard API.
-  // The service worker context has clipboardWrite permission and no CORS restriction.
   if (msg.type === "CLIPBOARD_WRITE") {
     (async () => {
       try {
-        // offscreen document approach (MV3 service workers have no DOM)
-        // Store the text in session storage — the content script will read it back
-        // via a direct clipboard write on next user gesture if needed.
-        // For now, store so the NEXT paste_text attempt can try again.
         await chrome.storage.session.set({ pendingClipboard: msg.text });
         sendResponse({ ok: true });
       } catch (e) {
@@ -45,21 +61,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
-  // ── VM_ACTION relay (Cross-frame communication) ───────────────────────────
-  // If the instructions are in an iframe but the VM canvas is in the top frame,
-  // the iframe sends VM_ACTION here, and we broadcast it to all frames in the tab.
+  // ── VM_ACTION relay ───────────────────────────────────────────────────────
   if (msg.type === "VM_ACTION" && sender.tab) {
     chrome.tabs.sendMessage(sender.tab.id, msg).catch(() => {});
     return false;
   }
 
-  // ── CAPTURE_SCREEN ──────────────────────────────────────────────────────────
+  // ── CAPTURE_SCREEN ────────────────────────────────────────────────────────
   if (msg.type === "CAPTURE_SCREEN" && sender.tab) {
     chrome.tabs.captureVisibleTab(sender.tab.windowId, { format: "jpeg", quality: 60 }, (dataUrl) => {
       if (chrome.runtime.lastError) {
         sendResponse({ error: chrome.runtime.lastError.message });
       } else {
-        // Strip the "data:image/jpeg;base64," prefix for Gemini
         const base64 = dataUrl ? dataUrl.split(",")[1] : null;
         sendResponse({ imageBase64: base64 });
       }
@@ -67,81 +80,177 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // ── NATIVE_KEY (Debugger Keystroke Injection) ─────────────────────────────
+  // ── NATIVE_KEY ────────────────────────────────────────────────────────────
   if (msg.type === "NATIVE_KEY" && sender.tab) {
     ensureDebugger(sender.tab.id, () => {
       dispatchNativeKey(sender.tab.id, msg.key, msg.modifiers || 0, msg.text || "", () => {
         sendResponse({ ok: true });
       });
     });
-    return true; // Keep channel open for async response
+    return true;
   }
 
   if (msg.type === "DETACH_DEBUGGER" && sender.tab) {
     if (attachedTabs.has(sender.tab.id)) {
-       chrome.debugger.detach({ tabId: sender.tab.id }, () => {
-         attachedTabs.delete(sender.tab.id);
-         sendResponse({ ok: true });
-       });
-       return true;
+      chrome.debugger.detach({ tabId: sender.tab.id }, () => {
+        attachedTabs.delete(sender.tab.id);
+        sendResponse({ ok: true });
+      });
+      return true;
     }
     sendResponse({ ok: true });
     return false;
   }
 });
 
-// ─── Gemini API Call ──────────────────────────────────────────────────────────
-// BUG-02 FIX: Raised maxOutputTokens to 2048 so coding lab solutions are never truncated.
-// BUG-13 FIX: Surface API errors (bad key, quota exceeded) instead of silently returning "".
-async function handleAI(prompt, apiKey, imageBase64 = null) {
+// ─── Multi-Provider AI Call ───────────────────────────────────────────────────
+async function handleAI(prompt, apiKey, imageBase64 = null, provider = "gemini", model = null) {
+  // Normalize provider
+  const prov = (provider || "gemini").toLowerCase();
+
   if (!apiKey) return { error: "No API key provided." };
-  
+
   try {
-    const parts = [{ text: prompt }];
-    
-    if (imageBase64) {
-      parts.push({
-        inlineData: {
-          mimeType: "image/jpeg",
-          data: imageBase64
-        }
-      });
+    switch (prov) {
+      case "openai":
+        return await callOpenAI(prompt, apiKey, model, imageBase64);
+      case "openrouter":
+        return await callOpenRouter(prompt, apiKey, model, imageBase64);
+      case "gemini":
+      default:
+        return await callGemini(prompt, apiKey, model, imageBase64);
     }
-
-    const resp = await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
-      })
-    });
-
-    if (!resp.ok) {
-      // HTTP-level error (401 invalid key, 429 quota, 500 server)
-      const errBody = await resp.text().catch(() => resp.statusText);
-      return { error: `Gemini API error ${resp.status}: ${errBody.slice(0, 120)}` };
-    }
-
-    const data = await resp.json();
-
-    // BUG-13 FIX: Check for application-level error payload
-    if (data.error) {
-      return { error: `Gemini error: ${data.error.message || JSON.stringify(data.error)}` };
-    }
-
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-
-    // Detect finish reason — SAFETY means the answer was blocked
-    const finishReason = data?.candidates?.[0]?.finishReason;
-    if (finishReason === "SAFETY") {
-      return { error: "Gemini blocked the response for safety reasons." };
-    }
-
-    return { text: text.trim() };
   } catch (e) {
     return { error: `Network error: ${e.message}` };
   }
+}
+
+// ─── Gemini ───────────────────────────────────────────────────────────────────
+async function callGemini(prompt, apiKey, model, imageBase64) {
+  const resolvedModel = model || PROVIDERS.gemini.defaultModel;
+  const endpoint = PROVIDERS.gemini.endpoint(resolvedModel);
+
+  const parts = [{ text: prompt }];
+  if (imageBase64) {
+    parts.push({ inlineData: { mimeType: "image/jpeg", data: imageBase64 } });
+  }
+
+  const resp = await fetch(`${endpoint}?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
+    })
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => resp.statusText);
+    // Auto-retry with fallback model if this model is gone (404)
+    if (resp.status === 404 && resolvedModel !== "gemini-2.5-flash") {
+      console.warn(`[AI] Gemini model ${resolvedModel} unavailable, retrying with gemini-2.5-flash`);
+      return await callGemini(prompt, apiKey, "gemini-2.5-flash", imageBase64);
+    }
+    return { error: `Gemini API error ${resp.status}: ${errBody.slice(0, 200)}` };
+  }
+
+  const data = await resp.json();
+  if (data.error) return { error: `Gemini error: ${data.error.message || JSON.stringify(data.error)}` };
+
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  const finishReason = data?.candidates?.[0]?.finishReason;
+  if (finishReason === "SAFETY") return { error: "Gemini blocked the response for safety reasons." };
+
+  return { text: text.trim() };
+}
+
+// ─── OpenAI ───────────────────────────────────────────────────────────────────
+async function callOpenAI(prompt, apiKey, model, imageBase64) {
+  const resolvedModel = model || PROVIDERS.openai.defaultModel;
+
+  const messages = [];
+  if (imageBase64) {
+    // Vision-capable request
+    messages.push({
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: "low" } }
+      ]
+    });
+  } else {
+    messages.push({ role: "user", content: prompt });
+  }
+
+  const resp = await fetch(PROVIDERS.openai.endpoint(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: resolvedModel,
+      messages,
+      temperature: 0.1,
+      max_tokens: 4096
+    })
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => resp.statusText);
+    return { error: `OpenAI API error ${resp.status}: ${errBody.slice(0, 200)}` };
+  }
+
+  const data = await resp.json();
+  if (data.error) return { error: `OpenAI error: ${data.error.message}` };
+
+  const text = data?.choices?.[0]?.message?.content ?? "";
+  return { text: text.trim() };
+}
+
+// ─── OpenRouter ───────────────────────────────────────────────────────────────
+async function callOpenRouter(prompt, apiKey, model, imageBase64) {
+  const resolvedModel = model || PROVIDERS.openrouter.defaultModel;
+
+  const messages = [];
+  if (imageBase64) {
+    messages.push({
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
+      ]
+    });
+  } else {
+    messages.push({ role: "user", content: prompt });
+  }
+
+  const resp = await fetch(PROVIDERS.openrouter.endpoint(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+      "HTTP-Referer": "https://github.com/TomTaruc/cengage-automator",
+      "X-Title": "Cengage Automator"
+    },
+    body: JSON.stringify({
+      model: resolvedModel,
+      messages,
+      temperature: 0.1,
+      max_tokens: 4096
+    })
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => resp.statusText);
+    return { error: `OpenRouter API error ${resp.status}: ${errBody.slice(0, 200)}` };
+  }
+
+  const data = await resp.json();
+  if (data.error) return { error: `OpenRouter error: ${data.error.message || JSON.stringify(data.error)}` };
+
+  const text = data?.choices?.[0]?.message?.content ?? "";
+  return { text: text.trim() };
 }
 
 // ─── Debugger API Bridge (Native Keystrokes) ──────────────────────────────────
