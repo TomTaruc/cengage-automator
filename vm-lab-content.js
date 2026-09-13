@@ -170,6 +170,8 @@
   }
 
   function getFullPanelText() {
+    // Sub-frames should not interpret their own body as lab instructions;
+    // only the top frame (which shows the Cengage instruction panel) should do this.
     for (const sel of STEP_TEXT_SELECTORS) {
       try {
         const el = document.querySelector(sel);
@@ -179,18 +181,13 @@
       } catch (_) {}
     }
 
-    if (window.self !== window.top) {
-      const text = document.body.innerText?.trim();
-      if (text && text.length > 80) return cleanStepText(text);
-    }
-
-    // Last resort: scan right side of viewport
+    // Last resort: scan right side of viewport (top frame only)
+    if (!IS_TOP_FRAME) return "";
     const viewW = window.innerWidth;
-    const elements = [...document.querySelectorAll("div, section, aside, main, article, iframe")];
+    const elements = [...document.querySelectorAll("div, section, aside, main, article")];
     for (const el of elements) {
       const rect = el.getBoundingClientRect();
       if (rect.left > viewW * 0.45 && rect.width > 80 && rect.height > 100) {
-        if (el.tagName === "IFRAME") continue;
         const text = el.innerText?.trim();
         if (text && text.length > 80) return cleanStepText(text);
       }
@@ -604,15 +601,18 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
   // ─── Verify Button & Result ────────────────────────────────────────────────
   async function clickVerify() {
-    const allBtns = [...document.querySelectorAll("button, [role='button'], a")];
+    const allBtns = [...document.querySelectorAll("button, [role='button']")];
     for (const btn of allBtns) {
       const text = (btn.innerText || btn.getAttribute("aria-label") || "").trim().toLowerCase();
+      // ⚠ Deliberately EXCLUDE "submit" and bare "check" — too broad:
+      //   "submit" would accidentally submit the whole assignment mid-lab.
+      //   "check" matches too many unrelated page elements.
       if (
         (text === "verify" || text === "check work" || text === "verify work" ||
-         text === "check answer" || text === "submit" || text === "check") &&
+         text === "check answer" || text === "verify step" || text === "check step") &&
         isVisible(btn) && !btn.disabled
       ) {
-        sendStatus("Clicking Verify/Check...", "info");
+        sendStatus(`Clicking Verify: "${btn.innerText?.trim()}"`, "info");
         btn.scrollIntoView({ behavior: "smooth", block: "center" });
         await delay(300);
         btn.click();
@@ -624,14 +624,17 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
   function checkVerificationPassed() {
     const bodyText = document.body.innerText.toLowerCase();
+    // Use specific LOD failure phrases — avoid broad words like "incorrect"
+    // which appear in instructional text and cause false failures.
     if (
       bodyText.includes("verification failed") ||
-      bodyText.includes("not complete") ||
-      bodyText.includes("did not pass") ||
-      bodyText.includes("incorrect")
+      bodyText.includes("task did not pass") ||
+      bodyText.includes("did not pass verification") ||
+      bodyText.includes("step not complete")
     ) {
       return false;
     }
+    // If all visible task checkboxes are checked, verification passed
     const checkboxes = [...document.querySelectorAll("input[type='checkbox']")];
     const visible = checkboxes.filter(cb => isVisible(cb));
     if (visible.length > 0 && !visible.every(cb => cb.checked)) return false;
@@ -639,10 +642,11 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
   }
 
   function isLabComplete() {
+    // Use specific phrases — avoid "score:" which appears in instructions
     const keywords = [
       "lab complete", "activity complete", "assignment complete",
       "you have completed", "congratulations", "great job",
-      "score:", "you scored", "lab finished", "well done",
+      "you scored", "lab finished", "well done",
       "0 minutes remaining", "time expired"
     ];
     const body = document.body.innerText.toLowerCase();
@@ -885,10 +889,11 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
       if (!stepText) {
         if (stepCount === 1) {
-          // This frame is the canvas frame — just wait for VM_ACTION messages
-          sendStatus("Acting as Canvas node (no instructions found here)", "info");
-          isRunning = false;
-          return;
+          // Top frame couldn't find instructions on first attempt — wait and retry
+          // rather than hard-stopping (the page may still be loading).
+          sendStatus("No instructions on first attempt — waiting for page to load...", "warn");
+          await delay(4000);
+          continue;
         }
         sendStatus("No step instruction found — waiting...", "warn");
         await delay(3000);
@@ -937,11 +942,12 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
         await delay(7000);
         const passed = checkVerificationPassed();
         if (!passed) {
-          sendStatus("⛔ Verification FAILED — stopping so you can review.", "error");
-          isRunning = false;
-          return;
+          // Demote from hard-stop to warn: some labs show transient failure messages
+          // that clear after a moment; don't halt the entire run.
+          sendStatus("⚠ Verification may have failed — review the result above. Continuing...", "warn");
+        } else {
+          sendStatus("✅ Verification PASSED!", "success");
         }
-        sendStatus("✅ Verification PASSED!", "success");
       }
 
       await delay(currentSpeed * 0.5);
