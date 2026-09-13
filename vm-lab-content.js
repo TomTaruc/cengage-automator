@@ -23,6 +23,14 @@
 (function () {
   "use strict";
 
+  // ─── Frame Guard ────────────────────────────────────────────────────────────
+  // Only ONE frame should run the master loop — the top-level frame that has the
+  // instruction panel. Sub-frames (VM canvas iframes) only listen for VM_ACTION.
+  // We detect this lazily: if the first getCurrentStepText() call on stepCount==1
+  // returns nothing, this frame exits the master loop and stays as a canvas node.
+  // This flag prevents multiple frames from calling runVMLab() when START is sent.
+  const IS_TOP_FRAME = (window.self === window.top);
+
   // ─── State ─────────────────────────────────────────────────────────────────
   let isRunning      = false;
   let stopRequested  = false;
@@ -983,34 +991,51 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
   // ─── Message Handler ─────────────────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+
+    // Only the top-level frame runs the master loop — sub-frames just relay VM_ACTION
     if (msg.type === "START_VM_LAB") {
-      currentSpeed = speedToMs(msg.speed || 2);
-      runVMLab();
+      if (IS_TOP_FRAME) {
+        currentSpeed = speedToMs(msg.speed || 2);
+        runVMLab();
+      }
       sendResponse({ ok: true });
     }
+
     if (msg.type === "STOP_AUTOMATION") {
       stopRequested = true;
       isRunning = false;
-      sendStatus("VM lab stopped by user.", "warn");
+      if (IS_TOP_FRAME) sendStatus("VM lab stopped by user.", "warn");
       sendResponse({ ok: true });
     }
+
     if (msg.type === "STEP_ONCE_VM") {
-      currentSpeed = speedToMs(msg.speed || 2);
-      stepOnceVM();
+      if (IS_TOP_FRAME) {
+        currentSpeed = speedToMs(msg.speed || 2);
+        stepOnceVM();
+      }
       sendResponse({ ok: true });
     }
+
     if (msg.type === "VM_ACTION") {
-      // Only the frame with the VM canvas executes keyboard actions
-      if (getVMCanvas() || document.querySelector("iframe")) {
+      // Execute keystrokes only in frames that own the VM canvas.
+      // Sub-frames (canvas frames) act; the top instructions frame does not.
+      const hasCanvas = !!getVMCanvas();
+      const isCanvasFrame = hasCanvas || (!IS_TOP_FRAME && !!document.querySelector("canvas, iframe"));
+      if (isCanvasFrame) {
         executeActionsLocally(msg.actions);
       }
     }
+
     if (msg.type === "PING") {
-      sendResponse({ alive: true, mode: "vm-lab" });
+      sendResponse({ alive: true, mode: "vm-lab", isTopFrame: IS_TOP_FRAME });
     }
+
     return true;
   });
 
-  sendStatus("🖥️ VM Lab Automator v3.0 loaded — open the popup to start.", "info");
+  // Only announce from the top frame to avoid duplicate popup log entries
+  if (IS_TOP_FRAME) {
+    sendStatus("🖥️ VM Lab Automator v3.0 loaded — open the popup to start.", "info");
+  }
 
 })();
