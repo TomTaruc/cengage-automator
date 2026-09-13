@@ -50,9 +50,9 @@
 
   function speedToMs(speed) {
     switch (parseInt(speed, 10)) {
-      case 3: return 600;
-      case 2: return 1500;
-      default: return 2500;
+      case 3: return 400;   // Fast
+      case 2: return 1000;  // Medium
+      default: return 2000; // Slow
     }
   }
 
@@ -258,11 +258,11 @@
   async function typeTextNatively(text) {
     sendStatus(`Native typing: "${text.slice(0, 60)}"`, "info");
     focusVM();
-    await delay(300);
+    await delay(200);
     for (const char of text) {
       if (stopRequested) break;
       await sendNativeKey(char, 0, char);
-      await delay(30);
+      await delay(15); // 15ms per char (was 30ms)
     }
     return true;
   }
@@ -493,29 +493,29 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
       case "focus_vm":
         sendStatus("Focusing VM", "info");
         focusVM();
-        await delay(400);
+        await delay(250);
         break;
 
       case "type_text":
         await typeTextNatively(String(action.value || ""));
-        await delay(currentSpeed * 0.3);
+        await delay(currentSpeed * 0.2);
         break;
 
       case "key":
         sendStatus(`Key: ${action.value}`, "info");
         focusVM();
-        await delay(200);
+        await delay(100);
         await sendNativeKey(String(action.value));
-        await delay(currentSpeed * 0.2);
+        await delay(currentSpeed * 0.15);
         break;
 
       case "shortcut": {
         sendStatus(`Shortcut: ${action.value}`, "info");
         focusVM();
-        await delay(200);
+        await delay(100);
         const { key, mods } = parseShortcut(String(action.value));
         await sendNativeKey(key, mods);
-        await delay(currentSpeed * 0.3);
+        await delay(currentSpeed * 0.2);
         break;
       }
 
@@ -523,13 +523,13 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
         const cmd = String(action.value || "");
         sendStatus(`Win+R → ${cmd}`, "info");
         focusVM();
-        await delay(300);
+        await delay(200);
         await sendNativeKey("r", 4); // Win+R (Meta=4)
-        await delay(1500);
+        await delay(1000);
         await typeTextNatively(cmd);
-        await delay(300);
+        await delay(200);
         await sendNativeKey("Enter");
-        await delay(action.waitAfter || 3000);
+        await delay(action.waitAfter || 2500);
         break;
       }
 
@@ -562,15 +562,15 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
   function estimateWait(actions) {
     return actions.reduce((acc, a) => {
       if (a.type === "wait") return acc + Number(a.value || 1000);
-      if (a.type === "win_run") return acc + 1500 + Number(a.waitAfter || 3000);
-      if (a.type === "type_text") return acc + (String(a.value || "").length * 35) + 500;
-      return acc + 500;
+      if (a.type === "win_run") return acc + 1000 + Number(a.waitAfter || 2500);
+      if (a.type === "type_text") return acc + (String(a.value || "").length * 18) + 300;
+      return acc + 200; // focus_vm, key, shortcut
     }, 0);
   }
 
   // ─── Navigation ─────────────────────────────────────────────────────────────
   async function clickNext() {
-    await delay(currentSpeed * 0.4);
+    await delay(currentSpeed * 0.2);
     for (const sel of NEXT_BTN_SELECTORS) {
       try {
         const btn = document.querySelector(sel);
@@ -711,7 +711,7 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
     if (parsed.first_actions && Array.isArray(parsed.first_actions) && parsed.first_actions.length > 0) {
       sendStatus("Executing Phase 0 first actions...", "info");
       dispatchActionsToVM(parsed.first_actions);
-      await delay(estimateWait(parsed.first_actions) + 2000);
+      await delay(estimateWait(parsed.first_actions) + 1000);
     }
 
     return globalChecklist;
@@ -772,7 +772,7 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
       if (ai.actions && ai.actions.length > 0 && ai.status !== "verify_only") {
         sendStatus(`▶ Executing ${ai.actions.length} action(s)...`, "info");
         dispatchActionsToVM(ai.actions);
-        const waitMs = estimateWait(ai.actions) + 2500;
+        const waitMs = estimateWait(ai.actions) + 1000;
         sendStatus(`⏳ Waiting ${Math.round(waitMs / 1000)}s for VM to update...`, "info");
         await delay(waitMs);
       }
@@ -812,7 +812,7 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
       }
 
       // Default: in_progress — loop again
-      await delay(1000);
+      await delay(600);
     }
 
     sendStatus(`Max iterations (${MAX_ITERATIONS}) reached for this step.`, "warn");
@@ -939,7 +939,7 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
       const clickedVerify = await clickVerify();
       if (clickedVerify) {
         sendStatus("Waiting for LOD verification scripts to run...", "info");
-        await delay(7000);
+        await delay(5000);
         const passed = checkVerificationPassed();
         if (!passed) {
           // Demote from hard-stop to warn: some labs show transient failure messages
@@ -987,7 +987,7 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
     const clickedVerify = await clickVerify();
     if (clickedVerify) {
       sendStatus("Waiting for verification...", "info");
-      await delay(6000);
+      await delay(4000);
       const passed = checkVerificationPassed();
       sendStatus(passed ? "✅ Verification PASSED!" : "⛔ Verification FAILED!", passed ? "success" : "error");
     }
