@@ -24,12 +24,30 @@
   "use strict";
 
   // ─── Frame Guard ────────────────────────────────────────────────────────────
-  // Only ONE frame should run the master loop — the top-level frame that has the
-  // instruction panel. Sub-frames (VM canvas iframes) only listen for VM_ACTION.
-  // We detect this lazily: if the first getCurrentStepText() call on stepCount==1
-  // returns nothing, this frame exits the master loop and stays as a canvas node.
-  // This flag prevents multiple frames from calling runVMLab() when START is sent.
-  const IS_TOP_FRAME = (window.self === window.top);
+  // Cross-origin iframes each see window.self === window.top as TRUE, so the old
+  // IS_TOP_FRAME check fails on LOD pages (instructions + VM are separate origins).
+  // We use chrome.storage.session as a distributed mutex: the first frame to
+  // acquire the "vmMasterFrame" key becomes the master and runs the control loop.
+  // All other frames only execute VM_ACTION messages (keystrokes/clicks in the VM).
+  let IS_MASTER_FRAME = false; // set async via tryAcquireMasterLock()
+
+  function tryAcquireMasterLock() {
+    return new Promise(resolve => {
+      const myToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      // Write our token, then read back after a short race window
+      chrome.storage.session.set({ vmMasterFrame: myToken }, () => {
+        setTimeout(() => {
+          chrome.storage.session.get(["vmMasterFrame"], ({ vmMasterFrame }) => {
+            resolve(vmMasterFrame === myToken);
+          });
+        }, 80 + Math.random() * 120); // 80-200ms race window
+      });
+    });
+  }
+
+  function releaseMasterLock() {
+    chrome.storage.session.remove("vmMasterFrame");
+  }
 
   // ─── State ─────────────────────────────────────────────────────────────────
   let isRunning      = false;
@@ -200,23 +218,41 @@
    * Used for Phase 0 (read-entire-task-first).
    */
   function getAllInstructionsText() {
-    // Try to grab the entire instruction container
+    // 1. Try known instruction-panel selectors first
     for (const sel of STEP_TEXT_SELECTORS) {
       try {
         const el = document.querySelector(sel);
         if (el && el.innerText?.trim().length > 50) {
-          // Use up to 8000 chars so multi-section labs are fully captured
           return cleanStepText(el.innerText.trim()).slice(0, 8000);
         }
       } catch (_) {}
     }
-    // Fallback to body
-    const body = document.body.innerText?.trim() || "";
+
+    // 2. Scan all block elements for anything that looks like instructions
+    //    (contains numbered steps, task words, or substantial prose)
+    const TASK_WORDS = /\b(step|task|configure|install|open|click|enter|type|run|execute|verify|enable|disable|create|delete|navigate|right.click|command|terminal|server|network|firewall|policy|account|password|address|port)\b/i;
+    const candidates = [...document.querySelectorAll("div, section, article, main, aside, li, p")];
+    let best = "";
+    for (const el of candidates) {
+      try {
+        const t = el.innerText?.trim();
+        if (t && t.length > 100 && t.length > best.length && TASK_WORDS.test(t)) {
+          // Prefer elements that aren't the entire body (avoid pulling in nav/chrome)
+          if (el !== document.body && el.querySelectorAll("*").length < 300) {
+            best = t;
+          }
+        }
+      } catch (_) {}
+    }
+    if (best) return cleanStepText(best).slice(0, 8000);
+
+    // 3. Absolute fallback — entire body text
+    const body = document.body?.innerText?.trim() || "";
     return cleanStepText(body).slice(0, 8000);
   }
 
   function getCurrentStepText() {
-    return getActiveStepInstruction() || getFullPanelText();
+    return getActiveStepInstruction() || getFullPanelText() || getAllInstructionsText();
   }
 
   // ─── VM Canvas ──────────────────────────────────────────────────────────────
@@ -931,6 +967,7 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
     fullTaskText = "";
 
     sendStatus("🖥️ VM Lab automation starting (v3.0 — Full Agent Mode)...", "info");
+    sendStatus(`📍 Running in frame: ${location.href.slice(0, 80)}`, "info");
     await delay(currentSpeed);
 
     const labContext = detectLabContext();
@@ -1033,6 +1070,7 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
     if (stepCount >= MAX_STEPS) sendStatus("Max steps reached.", "warn");
     isRunning = false;
+    releaseMasterLock();
     sendStatus("🏁 VM lab automation ended.", "info");
   }
 
@@ -1067,50 +1105,62 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
   // ─── Message Handler ─────────────────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
-    // Only the top-level frame runs the master loop — sub-frames just relay VM_ACTION
     if (msg.type === "START_VM_LAB") {
-      if (IS_TOP_FRAME) {
-        currentSpeed = speedToMs(msg.speed || 2);
-        runVMLab();
-      }
+      // Use the master lock to elect exactly ONE frame as controller.
+      // All other frames will silently skip.
+      tryAcquireMasterLock().then(isMaster => {
+        IS_MASTER_FRAME = isMaster;
+        if (isMaster) {
+          sendStatus("🔒 Master frame elected — starting control loop.", "info");
+          currentSpeed = speedToMs(msg.speed || 2);
+          runVMLab();
+        } else {
+          sendStatus("🔕 Sub-frame: will execute VM actions only.", "info");
+        }
+      });
       sendResponse({ ok: true });
     }
 
     if (msg.type === "STOP_AUTOMATION") {
       stopRequested = true;
       isRunning = false;
-      if (IS_TOP_FRAME) sendStatus("VM lab stopped by user.", "warn");
-      sendResponse({ ok: true });
-    }
-
-    if (msg.type === "STEP_ONCE_VM") {
-      if (IS_TOP_FRAME) {
-        currentSpeed = speedToMs(msg.speed || 2);
-        stepOnceVM();
+      if (IS_MASTER_FRAME) {
+        releaseMasterLock();
+        sendStatus("VM lab stopped by user.", "warn");
       }
       sendResponse({ ok: true });
     }
 
+    if (msg.type === "STEP_ONCE_VM") {
+      tryAcquireMasterLock().then(isMaster => {
+        IS_MASTER_FRAME = isMaster;
+        if (isMaster) {
+          currentSpeed = speedToMs(msg.speed || 2);
+          stepOnceVM();
+        }
+      });
+      sendResponse({ ok: true });
+    }
+
     if (msg.type === "VM_ACTION") {
-      // Execute keystrokes only in frames that own the VM canvas.
-      // Sub-frames (canvas frames) act; the top instructions frame does not.
+      // Execute keystrokes in frames that have the VM canvas.
+      // The master (instructions) frame does NOT execute VM actions.
       const hasCanvas = !!getVMCanvas();
-      const isCanvasFrame = hasCanvas || (!IS_TOP_FRAME && !!document.querySelector("canvas, iframe"));
-      if (isCanvasFrame) {
+      const isCanvasFrame = hasCanvas || !!document.querySelector("canvas");
+      if (isCanvasFrame && !IS_MASTER_FRAME) {
         executeActionsLocally(msg.actions);
       }
     }
 
     if (msg.type === "PING") {
-      sendResponse({ alive: true, mode: "vm-lab", isTopFrame: IS_TOP_FRAME });
+      sendResponse({ alive: true, mode: "vm-lab", isMaster: IS_MASTER_FRAME });
     }
 
     return true;
   });
 
-  // Only announce from the top frame to avoid duplicate popup log entries
-  if (IS_TOP_FRAME) {
-    sendStatus("🖥️ VM Lab Automator v3.0 loaded — open the popup to start.", "info");
-  }
+  // Announce load from ALL frames so we can see injection in devtools;
+  // status goes to background but duplicate suppression is handled by the master lock.
+  sendStatus(`🖥️ VM Lab Automator v3.0 loaded (frame: ${location.href.slice(0, 60)}) — open popup to start.`, "info");
 
 })();
