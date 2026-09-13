@@ -186,50 +186,60 @@ async function checkCurrentPage() {
   });
 }
 
-// ─── Send message to content script ──────────────────────────────────────────
+// ─── Send message to content script (via background relay) ───────────────────
+// Direct chrome.tabs.sendMessage only reaches the TOP frame's listener.
+// LOD labs have the instructions in a CROSS-ORIGIN sub-iframe.
+// We route through background.js which broadcasts to ALL frames in the tab.
 async function sendToContent(type, extra = {}) {
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0];
       if (!tab) { resolve(null); return; }
-      chrome.tabs.sendMessage(tab.id, { type, speed: speedSlider.value, ...extra }, (resp) => {
-        if (chrome.runtime.lastError) {
-          const err = chrome.runtime.lastError.message || "";
-          if (err.includes("Could not establish connection") || err.includes("Receiving end does not exist")) {
-            // Content script not injected — try to inject it programmatically
+
+      // Ask the background to broadcast to all frames in this tab
+      chrome.runtime.sendMessage(
+        { type: "POPUP_BROADCAST", tabId: tab.id, payload: { type, speed: speedSlider.value, ...extra } },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            addLog(`❌ Extension error: ${chrome.runtime.lastError.message}`, "error");
+            resolve(null);
+            return;
+          }
+          if (resp && resp.error) {
+            // Background couldn't reach any frame — inject the script and retry
             addLog("⚠ Content script not loaded. Injecting now...", "warn");
             chrome.scripting.executeScript(
-              { target: { tabId: tab.id, allFrames: true }, files: ["vm-lab-content.js"] },
+              // Only inject into the top frame — cross-origin iframes are blocked by Chrome
+              { target: { tabId: tab.id, allFrames: false }, files: ["vm-lab-content.js"] },
               () => {
                 if (chrome.runtime.lastError) {
-                  addLog("❌ Auto-inject failed. Please press F5 to refresh the tab, then click Start again.", "error");
+                  addLog("❌ Auto-inject failed. Press F5 on the lab page and try again.", "error");
                   setRunningState(false);
                   resolve(null);
                   return;
                 }
-                addLog("✅ Content script injected. Retrying...", "info");
-                // Retry after a short delay for the script to initialize
+                addLog("✅ Injected. Retrying in 1s...", "info");
                 setTimeout(() => {
-                  chrome.tabs.sendMessage(tab.id, { type, speed: speedSlider.value, ...extra }, (resp2) => {
-                    if (chrome.runtime.lastError) {
-                      addLog("❌ Still could not reach content script. Press F5 on the lab page and try again.", "error");
-                      setRunningState(false);
-                      resolve(null);
-                    } else {
-                      resolve(resp2);
+                  chrome.runtime.sendMessage(
+                    { type: "POPUP_BROADCAST", tabId: tab.id, payload: { type, speed: speedSlider.value, ...extra } },
+                    (resp2) => {
+                      if (chrome.runtime.lastError || (resp2 && resp2.error)) {
+                        addLog("❌ Still unreachable. Press F5 on the lab tab, then try again.", "error");
+                        setRunningState(false);
+                        resolve(null);
+                      } else {
+                        resolve(resp2);
+                      }
                     }
-                  });
-                }, 800);
+                  );
+                }, 1000);
               }
             );
           } else {
-            addLog(`❌ Extension error: ${err}`, "error");
-            resolve(null);
+            resolve(resp);
           }
-          return;
         }
-        resolve(resp);
-      });
+      );
     });
   });
 }
