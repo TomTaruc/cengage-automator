@@ -23,6 +23,25 @@ const PROVIDERS = {
   }
 };
 
+// ─── Auto-reload lab tabs on extension update ─────────────────────────────────
+// When the extension is reloaded/updated, content scripts are NOT re-injected
+// into already-open tabs. Auto-reload LOD/Cengage tabs so they get fresh scripts.
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.tabs.query({}, (tabs) => {
+    for (const tab of tabs) {
+      const url = tab.url || "";
+      if (
+        url.includes("labondemand.com") ||
+        url.includes("labclient.labondemand.com") ||
+        url.includes("cengage.com") ||
+        url.includes("mindtap")
+      ) {
+        chrome.tabs.reload(tab.id);
+      }
+    }
+  });
+});
+
 // ─── Frame Registry ───────────────────────────────────────────────────────────
 // Cross-origin iframes can't be reached by chrome.tabs.sendMessage unless we
 // know their frameId. Content scripts register themselves here on load.
