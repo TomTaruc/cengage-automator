@@ -263,8 +263,21 @@
     /show\s+hints?/gi,
     /expand\s+this\s+hint/gi,
     /^resources?\s*$/gim,
-    /^instructions?\s*$/gim
+    /^instructions?\s*$/gim,
+    // Strip keyboard shortcut rows that appear in the VM toolbar
+    /Esc\s+F1\s+F2\s+F3[\s\S]*?F12/gi,
+    /^(Esc|F\d+|Tab|Caps|Shift|Ctrl|Alt|Win|Print|Scroll|Pause|Insert|Delete|Home|End|Page)\s*/gim,
+    // Strip UI control labels
+    /\b(Type Text|Send Text|Copy|Paste|Lightning Bolt|Fit Screen|Full Screen)\b/gi,
   ];
+
+  // Returns true if the text looks like real instructions (not keyboard chrome)
+  function looksLikeInstructions(text) {
+    if (!text || text.length < 60) return false;
+    // Must contain at least one sentence-like word found in lab instructions
+    const TASK_SIGNAL = /\b(step|task|configure|install|open|click|enter|type|run|execute|verify|enable|disable|create|delete|navigate|command|server|firewall|network|password|account|address|policy|service|script|check|display|window|apply|add|remove|select|right.click)\b/i;
+    return TASK_SIGNAL.test(text);
+  }
 
   function cleanStepText(raw) {
     if (!raw) return "";
@@ -354,7 +367,15 @@
   }
 
   function getCurrentStepText() {
-    return getActiveStepInstruction() || getFullPanelText() || getAllInstructionsText();
+    const candidates = [
+      getActiveStepInstruction(),
+      getFullPanelText(),
+      getAllInstructionsText()
+    ];
+    for (const text of candidates) {
+      if (text && looksLikeInstructions(text)) return text;
+    }
+    return null; // Nothing found that looks like real instructions
   }
 
   // ─── VM Canvas ──────────────────────────────────────────────────────────────
@@ -394,18 +415,18 @@
 
   // ─── Text Injection ──────────────────────────────────────────────────────────
   async function typeTextNatively(text) {
+  async function typeTextNatively(text) {
     sendStatus(`Native typing: "${text.slice(0, 60)}"`, "info");
     focusVM();
     await delay(200);
     for (const char of text) {
       if (stopRequested) break;
       if (char === "\n" || char === "\r") {
-        // Newline → send Enter key (char event alone won't trigger VM input)
         await sendNativeKey("Enter", 0, "");
       } else {
         await sendNativeKey(char, 0, char);
       }
-      await delay(15); // 15ms per char (was 30ms)
+      await delay(18); // 18ms per char — slightly slower for reliability
     }
     return true;
   }
@@ -602,7 +623,8 @@ A screenshot of the current VM state is attached. Analyze it carefully before de
 
 ## Available Actions
 - {"type":"focus_vm"} — focus the VM window before typing (always first)
-- {"type":"type_text","value":"text"} — type text via native keystrokes (use \\n for Enter within text)
+- {"type":"type_text","value":"text"} — type text via native keystrokes. NEVER add a trailing space. Use \\n only for Enter within multi-line text.
+- {"type":"clear_field"} — select all + delete in the currently focused field (use BEFORE typing into a field that already has content)
 - {"type":"paste_text","value":"multi-line text"} — clipboard paste via Ctrl+V (best for long commands or scripts with special chars)
 - {"type":"key","value":"Enter"} — single key: Enter, Tab, Escape, Space, Backspace, Delete, F1-F12, ArrowUp/Down/Left/Right, Home, End
 - {"type":"shortcut","value":"ctrl+c"} — keyboard shortcut
@@ -610,6 +632,17 @@ A screenshot of the current VM state is attached. Analyze it carefully before de
 - {"type":"wait","value":2000} — wait N ms (always add after win_run and slow operations)
 - {"type":"click","selector":".css-selector"} — click a DOM element in the Cengage instructions panel (NOT the VM canvas)
 - {"type":"scroll","direction":"down","amount":300} — scroll the instructions panel
+
+## Windows Login Screen (CRITICAL)
+When you see the Windows lock/login screen:
+1. First send: {"type":"shortcut","value":"ctrl+alt+delete"} then {"type":"wait","value":1500}
+2. The password field will appear. Click it or Tab to it.
+3. If a username field is present and already has the wrong user, use clear_field first, then type_text the correct username WITHOUT a trailing space.
+4. Tab to the password field (or click it).
+5. Use clear_field to clear any existing password.
+6. type_text the password EXACTLY — NO trailing space, NO extra Enter in the value itself.
+7. Then send {"type":"key","value":"Enter"} as a SEPARATE action.
+8. Wait 3000ms for the desktop to load.
 
 ## Common Windows Shortcuts
 - Windows Defender Firewall → win_run "wf.msc"
@@ -621,13 +654,13 @@ A screenshot of the current VM state is attached. Analyze it carefully before de
 - Command Prompt (admin) → shortcut "win+x" then type_text "a"
 - PowerShell → win_run "powershell.exe"
 - Task Manager → shortcut "ctrl+shift+esc"
-- Login screen → shortcut "ctrl+alt+delete", then type password + Enter
 
 ## Action Sequencing Rules
 - Always start actions with focus_vm
+- NEVER include a trailing space in type_text values — passwords and usernames must be exact
 - After win_run, always add wait 3000+
 - After app opens, add wait 2000 before interacting
-- After typing a command in terminal: always add {"type":"key","value":"Enter"} then {"type":"wait","value":2000}
+- After typing a command in terminal: add {"type":"key","value":"Enter"} as its own action, then {"type":"wait","value":2000}
 - After waiting, the NEXT iteration screenshots to verify the result
 
 Return ONLY a valid JSON object. Do NOT use markdown fences.
@@ -702,8 +735,21 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
         break;
 
       case "type_text":
-        await typeTextNatively(String(action.value || ""));
+        // Strip trailing spaces — the AI sometimes appends them accidentally
+        // (e.g. "Passw0rd! " instead of "Passw0rd!"). This is almost never intentional.
+        await typeTextNatively(String(action.value || "").replace(/\s+$/, ""));
         await delay(currentSpeed * 0.2);
+        break;
+
+      case "clear_field":
+        // Select all then delete — clears the currently focused field in the VM
+        sendStatus("Clearing field (Ctrl+A, Delete)", "info");
+        focusVM();
+        await delay(100);
+        await sendNativeKey("a", 2); // Ctrl+A
+        await delay(150);
+        await sendNativeKey("Delete", 0, "");
+        await delay(200);
         break;
 
       case "key":
