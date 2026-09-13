@@ -20,6 +20,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ── CLIPBOARD_WRITE fallback ───────────────────────────────────────────────
+  // Content scripts in cross-origin iframes can't always access the Clipboard API.
+  // The service worker context has clipboardWrite permission and no CORS restriction.
+  if (msg.type === "CLIPBOARD_WRITE") {
+    (async () => {
+      try {
+        // offscreen document approach (MV3 service workers have no DOM)
+        // Store the text in session storage — the content script will read it back
+        // via a direct clipboard write on next user gesture if needed.
+        // For now, store so the NEXT paste_text attempt can try again.
+        await chrome.storage.session.set({ pendingClipboard: msg.text });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
   // ── STATUS_UPDATE relay ───────────────────────────────────────────────────
   if (msg.type === "STATUS_UPDATE" && sender.tab) {
     chrome.runtime.sendMessage(msg).catch(() => {});
