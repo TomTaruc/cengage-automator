@@ -194,8 +194,38 @@ async function sendToContent(type, extra = {}) {
       if (!tab) { resolve(null); return; }
       chrome.tabs.sendMessage(tab.id, { type, speed: speedSlider.value, ...extra }, (resp) => {
         if (chrome.runtime.lastError) {
-          addLog("Could not reach content script. Refresh the page first.", "error");
-          resolve(null);
+          const err = chrome.runtime.lastError.message || "";
+          if (err.includes("Could not establish connection") || err.includes("Receiving end does not exist")) {
+            // Content script not injected — try to inject it programmatically
+            addLog("⚠ Content script not loaded. Injecting now...", "warn");
+            chrome.scripting.executeScript(
+              { target: { tabId: tab.id, allFrames: true }, files: ["vm-lab-content.js"] },
+              () => {
+                if (chrome.runtime.lastError) {
+                  addLog("❌ Auto-inject failed. Please press F5 to refresh the tab, then click Start again.", "error");
+                  setRunningState(false);
+                  resolve(null);
+                  return;
+                }
+                addLog("✅ Content script injected. Retrying...", "info");
+                // Retry after a short delay for the script to initialize
+                setTimeout(() => {
+                  chrome.tabs.sendMessage(tab.id, { type, speed: speedSlider.value, ...extra }, (resp2) => {
+                    if (chrome.runtime.lastError) {
+                      addLog("❌ Still could not reach content script. Press F5 on the lab page and try again.", "error");
+                      setRunningState(false);
+                      resolve(null);
+                    } else {
+                      resolve(resp2);
+                    }
+                  });
+                }, 800);
+              }
+            );
+          } else {
+            addLog(`❌ Extension error: ${err}`, "error");
+            resolve(null);
+          }
           return;
         }
         resolve(resp);
