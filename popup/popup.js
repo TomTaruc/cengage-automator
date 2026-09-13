@@ -193,48 +193,22 @@ async function sendToContent(type, extra = {}) {
       const tab = tabs[0];
       if (!tab) { resolve(null); return; }
 
+      addLog(`⏳ Connecting to lab tab (frame injection may take ~2s)...`, "info");
+
       chrome.runtime.sendMessage(
         { type: "POPUP_BROADCAST", tabId: tab.id, payload: { type, speed: speedSlider.value, ...extra } },
         (resp) => {
           if (chrome.runtime.lastError) {
             addLog(`❌ Extension error: ${chrome.runtime.lastError.message}`, "error");
+            setRunningState(false);
             resolve(null);
             return;
           }
           if (resp && resp.error) {
-            // No registered frames — the page needs a refresh to inject the content script
-            addLog("⚠ Content script not loaded. Injecting into top frame...", "warn");
-            chrome.scripting.executeScript(
-              { target: { tabId: tab.id, allFrames: false }, files: ["vm-lab-content.js"] },
-              () => {
-                if (chrome.runtime.lastError) {
-                  addLog("❌ Could not inject. Press F5 on the lab tab, then try again.", "error");
-                  setRunningState(false);
-                  resolve(null);
-                  return;
-                }
-                addLog("✅ Injected. Retrying in 1.5s...", "info");
-                setTimeout(() => {
-                  chrome.runtime.sendMessage(
-                    { type: "POPUP_BROADCAST", tabId: tab.id, payload: { type, speed: speedSlider.value, ...extra } },
-                    (resp2) => {
-                      if (chrome.runtime.lastError || (resp2 && resp2.error)) {
-                        // Still failing — the sub-frames need a real page refresh
-                        addLog("❌ The lab page needs a full refresh. Please:", "error");
-                        addLog("   1. Click the lab tab", "error");
-                        addLog("   2. Press F5 (or Ctrl+R)", "error");
-                        addLog("   3. Wait for the page to load", "error");
-                        addLog("   4. Then click Start again", "error");
-                        setRunningState(false);
-                        resolve(null);
-                      } else {
-                        resolve(resp2);
-                      }
-                    }
-                  );
-                }, 1500);
-              }
-            );
+            addLog(`❌ Could not reach any frame: ${resp.error}`, "error");
+            addLog("Try: close this tab, open a fresh LOD lab page, then click Start.", "warn");
+            setRunningState(false);
+            resolve(null);
           } else {
             resolve(resp);
           }
