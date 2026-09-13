@@ -33,6 +33,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ── POPUP_BROADCAST — relay popup command to all frames in a tab ─────────
+  // Direct chrome.tabs.sendMessage from the popup only reliably hits the top frame.
+  // From the background service worker we can broadcast to all frames.
+  // On LOD pages the relevant frames are sub-frames (VirtualizationClient, instructions),
+  // so we send to ALL frames and take the first successful response.
+  if (msg.type === "POPUP_BROADCAST") {
+    const { tabId, payload } = msg;
+    if (!tabId || !payload) { sendResponse({ error: "missing tabId or payload" }); return false; }
+
+    // Broadcast to ALL frames in the tab (background can reach cross-origin frames
+    // that loaded via content_scripts manifest declaration).
+    chrome.tabs.sendMessage(tabId, payload, (resp) => {
+      if (chrome.runtime.lastError || !resp) {
+        sendResponse({ error: chrome.runtime.lastError?.message || "no frame responded" });
+      } else {
+        sendResponse(resp);
+      }
+    });
+    return true; // async
+  }
+
   // ── Settings fetch ────────────────────────────────────────────────────────
   if (msg.type === "GET_SETTINGS") {
     chrome.storage.sync.get(

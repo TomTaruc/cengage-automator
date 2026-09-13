@@ -186,20 +186,60 @@ async function checkCurrentPage() {
   });
 }
 
-// ─── Send message to content script ──────────────────────────────────────────
+// ─── Send message to content script (via background relay) ───────────────────
+// Direct chrome.tabs.sendMessage only reaches the TOP frame's listener.
+// LOD labs have the instructions in a CROSS-ORIGIN sub-iframe.
+// We route through background.js which broadcasts to ALL frames in the tab.
 async function sendToContent(type, extra = {}) {
   return new Promise((resolve) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0];
       if (!tab) { resolve(null); return; }
-      chrome.tabs.sendMessage(tab.id, { type, speed: speedSlider.value, ...extra }, (resp) => {
-        if (chrome.runtime.lastError) {
-          addLog("Could not reach content script. Refresh the page first.", "error");
-          resolve(null);
-          return;
+
+      // Ask the background to broadcast to all frames in this tab
+      chrome.runtime.sendMessage(
+        { type: "POPUP_BROADCAST", tabId: tab.id, payload: { type, speed: speedSlider.value, ...extra } },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            addLog(`❌ Extension error: ${chrome.runtime.lastError.message}`, "error");
+            resolve(null);
+            return;
+          }
+          if (resp && resp.error) {
+            // Background couldn't reach any frame — inject the script and retry
+            addLog("⚠ Content script not loaded. Injecting now...", "warn");
+            chrome.scripting.executeScript(
+              // Only inject into the top frame — cross-origin iframes are blocked by Chrome
+              { target: { tabId: tab.id, allFrames: false }, files: ["vm-lab-content.js"] },
+              () => {
+                if (chrome.runtime.lastError) {
+                  addLog("❌ Auto-inject failed. Press F5 on the lab page and try again.", "error");
+                  setRunningState(false);
+                  resolve(null);
+                  return;
+                }
+                addLog("✅ Injected. Retrying in 1s...", "info");
+                setTimeout(() => {
+                  chrome.runtime.sendMessage(
+                    { type: "POPUP_BROADCAST", tabId: tab.id, payload: { type, speed: speedSlider.value, ...extra } },
+                    (resp2) => {
+                      if (chrome.runtime.lastError || (resp2 && resp2.error)) {
+                        addLog("❌ Still unreachable. Press F5 on the lab tab, then try again.", "error");
+                        setRunningState(false);
+                        resolve(null);
+                      } else {
+                        resolve(resp2);
+                      }
+                    }
+                  );
+                }, 1000);
+              }
+            );
+          } else {
+            resolve(resp);
+          }
         }
-        resolve(resp);
-      });
+      );
     });
   });
 }
