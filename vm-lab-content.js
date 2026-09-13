@@ -95,8 +95,20 @@
 
   // ─── Selectors ───────────────────────────────────────────────────────────────
 
-  // Cengage instruction panel (right side on LOD pages)
+  // LOD (labclient.labondemand.com) real IDs discovered by DOM inspection:
+  //   #instructionsContent  — outer panel that holds all instruction HTML
+  //   #pages .page.selected — currently visible step
+  //   #pages .page          — any step (fallback)
+  //   .task-list-item       — individual task items
+  // Also include common Cengage/MindTap class names as fallback.
   const STEP_TEXT_SELECTORS = [
+    // ── LOD / Skillable real selectors ──────────────────────────────────────
+    "#instructionsContent",
+    "#pages .page.selected",
+    "#pages .page",
+    ".task-list-item",
+    "#instructions-content",
+    // ── Generic Cengage / MindTap selectors ─────────────────────────────────
     ".instructions-content",
     ".lab-instructions",
     "#instructions-tab-content",
@@ -114,6 +126,11 @@
   ];
 
   const ACTIVE_STEP_SELECTORS = [
+    // LOD real selectors
+    "#pages .page.selected",
+    "#pages .page:not(.hidden)",
+    ".page.selected",
+    // Generic
     "[class*='active'][class*='step']",
     "[class*='current'][class*='step']",
     "[class*='step'].active",
@@ -124,7 +141,10 @@
     "[class*='active-task']"
   ];
 
+  // LOD uses id="next" and id="previous" for navigation buttons
   const NEXT_BTN_SELECTORS = [
+    "#next",
+    "#nextButton",
     "button[class*='next']",
     "[class*='next-btn']",
     "[class*='btn-next']",
@@ -137,7 +157,7 @@
     "button.btn-primary"
   ];
 
-  // VM remote desktop canvas or display element
+  // VM remote desktop canvas or display element (LOD uses a plain <canvas>)
   const VM_CANVAS_SELECTORS = [
     "canvas#vmDisplay",
     "canvas.vm-display",
@@ -188,8 +208,7 @@
   }
 
   function getFullPanelText() {
-    // Sub-frames should not interpret their own body as lab instructions;
-    // only the top frame (which shows the Cengage instruction panel) should do this.
+    // 1. Try known selectors (LOD first, then generic Cengage)
     for (const sel of STEP_TEXT_SELECTORS) {
       try {
         const el = document.querySelector(sel);
@@ -199,16 +218,17 @@
       } catch (_) {}
     }
 
-    // Last resort: scan right side of viewport (top frame only)
-    if (!IS_TOP_FRAME) return "";
+    // 2. Scan right side of viewport — LOD puts instructions in right ~20% of screen
     const viewW = window.innerWidth;
     const elements = [...document.querySelectorAll("div, section, aside, main, article")];
-    for (const el of elements) {
-      const rect = el.getBoundingClientRect();
-      if (rect.left > viewW * 0.45 && rect.width > 80 && rect.height > 100) {
-        const text = el.innerText?.trim();
-        if (text && text.length > 80) return cleanStepText(text);
-      }
+    // Sort by left position so we pick the rightmost substantial element
+    const rightCandidates = elements
+      .map(el => ({ el, rect: el.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.left > viewW * 0.4 && rect.width > 60 && rect.height > 100)
+      .sort((a, b) => b.rect.left - a.rect.left);
+    for (const { el } of rightCandidates) {
+      const text = el.innerText?.trim();
+      if (text && text.length > 80) return cleanStepText(text);
     }
     return "";
   }
