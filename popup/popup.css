@@ -316,3 +316,35 @@ body {
   background: linear-gradient(135deg, rgba(255,165,0,0.06), rgba(255,100,0,0.04));
 }
 
+
+/* ─── Provider / Model selectors ──────────────────────────────────────────── */
+.provider-select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border, #333);
+  background: var(--input-bg, #1a1a2e);
+  color: var(--text, #e0e0e0);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+}
+.provider-select:focus {
+  border-color: var(--accent, #00d4aa);
+}
+.model-row input[type="text"] {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border, #333);
+  background: var(--input-bg, #1a1a2e);
+  color: var(--text, #e0e0e0);
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+  box-sizing: border-box;
+}
+.model-row input[type="text"]:focus {
+  border-color: var(--accent, #00d4aa);
+}

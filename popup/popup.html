@@ -61,18 +61,32 @@
 
     <!-- API Key -->
     <div class="card">
-      <div class="section-label">Gemini API Key</div>
-      <div class="input-group">
-        <input type="password" id="api-key" placeholder="AIza..." autocomplete="off" spellcheck="false" />
-        <button class="eye-btn" id="toggle-key" title="Show/hide key">
-          <svg id="eye-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-            <circle cx="12" cy="12" r="3"/>
-          </svg>
-        </button>
+      <div class="section-label">AI Provider</div>
+      <select id="ai-provider" class="provider-select">
+        <option value="gemini">Gemini (Google AI Studio)</option>
+        <option value="openai">ChatGPT (OpenAI)</option>
+        <option value="openrouter">OpenRouter (multi-model)</option>
+      </select>
+
+      <div id="model-row" class="model-row" style="margin-top:8px">
+        <input type="text" id="ai-model" placeholder="Model (leave blank for default)" autocomplete="off" spellcheck="false" />
+        <div class="api-hint" id="model-hint">Default: gemini-2.5-flash</div>
       </div>
-      <div class="api-hint">
-        Get a free key at <a href="https://aistudio.google.com" target="_blank" id="ai-studio-link">aistudio.google.com</a>
+
+      <div style="margin-top:8px">
+        <div class="section-label" id="key-label">Gemini API Key</div>
+        <div class="input-group">
+          <input type="password" id="api-key" placeholder="AIza..." autocomplete="off" spellcheck="false" />
+          <button class="eye-btn" id="toggle-key" title="Show/hide key">
+            <svg id="eye-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+        </div>
+        <div class="api-hint" id="key-hint">
+          Get a free key at <a href="https://aistudio.google.com" target="_blank">aistudio.google.com</a>
+        </div>
       </div>
     </div>
 

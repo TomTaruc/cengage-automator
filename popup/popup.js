@@ -19,9 +19,51 @@ const clearLogBtn   = $("clear-log");
 const statusCard    = document.querySelector(".status-card");
 const modeBadge     = $("mode-badge");
 const modeLabel     = $("mode-label");
+const providerSelect = $("ai-provider");
+const modelInput    = $("ai-model");
+const keyLabel      = $("key-label");
+const keyHint       = $("key-hint");
+const modelHint     = $("model-hint");
 
 let isRunning  = false;
-let isVMMode   = false;  // true when on labclient.labondemand.com
+let isVMMode   = false;
+
+// ─── Provider config ──────────────────────────────────────────────────────────
+const PROVIDER_CONFIG = {
+  gemini: {
+    label: "Gemini API Key",
+    placeholder: "AIza...",
+    hint: 'Get a free key at <a href="https://aistudio.google.com" target="_blank">aistudio.google.com</a>',
+    defaultModel: "gemini-2.5-flash",
+    storageKey: "apiKey"
+  },
+  openai: {
+    label: "OpenAI API Key",
+    placeholder: "sk-...",
+    hint: 'Get a key at <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com</a>',
+    defaultModel: "gpt-4o-mini",
+    storageKey: "openaiKey"
+  },
+  openrouter: {
+    label: "OpenRouter API Key",
+    placeholder: "sk-or-...",
+    hint: 'Get a free key at <a href="https://openrouter.ai/keys" target="_blank">openrouter.ai</a>',
+    defaultModel: "openai/gpt-4o-mini",
+    storageKey: "openrouterKey"
+  }
+};
+
+function applyProviderUI(provider) {
+  const cfg = PROVIDER_CONFIG[provider] || PROVIDER_CONFIG.gemini;
+  keyLabel.textContent = cfg.label;
+  apiKeyInput.placeholder = cfg.placeholder;
+  keyHint.innerHTML = cfg.hint;
+  modelHint.textContent = `Default: ${cfg.defaultModel}`;
+  // Load the saved key for this provider
+  chrome.storage.sync.get([cfg.storageKey], (data) => {
+    apiKeyInput.value = data[cfg.storageKey] || "";
+  });
+}
 
 // ─── Speed labels ─────────────────────────────────────────────────────────────
 const speedLabels = { "1": "Slow", "2": "Medium", "3": "Fast" };
@@ -54,17 +96,41 @@ function setRunningState(running) {
 }
 
 // ─── Load saved settings ──────────────────────────────────────────────────────
-chrome.storage.sync.get(["apiKey", "speed", "enabled"], (data) => {
-  if (data.apiKey)  apiKeyInput.value = data.apiKey;
-  if (data.speed)   speedSlider.value = data.speed;
-  if (data.enabled) enableToggle.checked = data.enabled;
-  speedValue.textContent = speedLabels[speedSlider.value] || "Medium";
-});
+chrome.storage.sync.get(
+  ["apiKey", "openaiKey", "openrouterKey", "provider", "model", "speed", "enabled"],
+  (data) => {
+    if (data.speed)    speedSlider.value = data.speed;
+    if (data.enabled)  enableToggle.checked = data.enabled;
+    speedValue.textContent = speedLabels[speedSlider.value] || "Medium";
+
+    const savedProvider = data.provider || "gemini";
+    providerSelect.value = savedProvider;
+    applyProviderUI(savedProvider);
+
+    if (data.model) modelInput.value = data.model;
+  }
+);
 
 // ─── Save settings on change ──────────────────────────────────────────────────
-apiKeyInput.addEventListener("input", () => {
-  chrome.storage.sync.set({ apiKey: apiKeyInput.value });
+providerSelect.addEventListener("change", () => {
+  const provider = providerSelect.value;
+  chrome.storage.sync.set({ provider });
+  applyProviderUI(provider);
 });
+
+modelInput.addEventListener("input", () => {
+  chrome.storage.sync.set({ model: modelInput.value });
+});
+
+apiKeyInput.addEventListener("input", () => {
+  const provider = providerSelect.value;
+  const cfg = PROVIDER_CONFIG[provider] || PROVIDER_CONFIG.gemini;
+  // Always also save to "apiKey" as fallback
+  const obj = { apiKey: apiKeyInput.value };
+  obj[cfg.storageKey] = apiKeyInput.value;
+  chrome.storage.sync.set(obj);
+});
+
 speedSlider.addEventListener("input", () => {
   speedValue.textContent = speedLabels[speedSlider.value];
   chrome.storage.sync.set({ speed: speedSlider.value });
@@ -141,7 +207,9 @@ async function sendToContent(type, extra = {}) {
 // ─── Buttons ─────────────────────────────────────────────────────────────────
 btnStart.addEventListener("click", async () => {
   if (!apiKeyInput.value.trim()) {
-    addLog("Please enter your Gemini API key first.", "warn");
+    const provider = providerSelect.value;
+    const cfg = PROVIDER_CONFIG[provider] || PROVIDER_CONFIG.gemini;
+    addLog(`Please enter your ${cfg.label} first.`, "warn");
     apiKeyInput.focus();
     return;
   }
@@ -151,7 +219,9 @@ btnStart.addEventListener("click", async () => {
     return;
   }
 
-  addLog(isVMMode ? "Starting VM lab automation…" : "Starting automation…", "info");
+  const provider = providerSelect.value;
+  const model = modelInput.value.trim() || null;
+  addLog(`Starting${isVMMode ? " VM lab" : ""} automation… [${provider}${model ? "/" + model : ""}]`, "info");
   setRunningState(true);
 
   if (isVMMode) {

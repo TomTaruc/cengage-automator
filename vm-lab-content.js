@@ -413,17 +413,27 @@
   // ─── AI Integration ─────────────────────────────────────────────────────────
   function askAI(prompt, imageBase64 = null) {
     return new Promise(resolve => {
-      chrome.storage.sync.get(["apiKey"], ({ apiKey }) => {
+      chrome.storage.sync.get(["apiKey", "openaiKey", "openrouterKey", "provider", "model"], (data) => {
+        const provider = data.provider || "gemini";
+        const model = data.model || null;
+        // Pick the right API key for the selected provider
+        let apiKey = data.apiKey || "";
+        if (provider === "openai") apiKey = data.openaiKey || data.apiKey || "";
+        if (provider === "openrouter") apiKey = data.openrouterKey || data.apiKey || "";
+
         if (!apiKey) { resolve(""); return; }
-        chrome.runtime.sendMessage({ type: "ASK_AI", prompt, apiKey, imageBase64 }, resp => {
-          if (chrome.runtime.lastError || !resp) { resolve(""); return; }
-          if (resp.error) {
-            sendStatus(`AI error: ${resp.error}`, "error");
-            resolve("");
-            return;
+        chrome.runtime.sendMessage(
+          { type: "ASK_AI", prompt, apiKey, imageBase64, provider, model },
+          resp => {
+            if (chrome.runtime.lastError || !resp) { resolve(""); return; }
+            if (resp.error) {
+              sendStatus(`AI error: ${resp.error}`, "error");
+              resolve("");
+              return;
+            }
+            resolve(resp.text || "");
           }
-          resolve(resp.text || "");
-        });
+        );
       });
     });
   }
@@ -1289,6 +1299,8 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     if (msg.type === "START_VM_LAB") {
+      // Guard: if already running in this frame, ignore the duplicate message.
+      if (isRunning) { sendResponse({ ok: true }); return true; }
       // Use the master lock to elect exactly ONE frame as controller.
       // The frame with the highest capability priority wins (instructions > canvas > unknown).
       tryAcquireMasterLock().then(isMaster => {
