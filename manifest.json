@@ -30,7 +30,11 @@
     },
     {
       "matches": [
-        "<all_urls>"
+        "https://*.labondemand.com/*",
+        "https://*.labclient.labondemand.com/*",
+        "https://*.skillable.com/*",
+        "https://*.cengage.com/*",
+        "https://*.mindtap.cengage.com/*"
       ],
       "js": ["vm-lab-content.js"],
       "run_at": "document_idle",

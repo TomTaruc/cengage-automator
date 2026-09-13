@@ -363,19 +363,100 @@
     return raw.replace(/^```[\w]*\r?\n?/, "").replace(/\r?\n?```\s*$/, "").trim();
   }
 
+  // ─── Shared Persona (injected into every AI prompt) ─────────────────────────
+  const AGENT_PERSONA = `
+## Core Rules — Non-Negotiable
+
+### 1. Read the Entire Task First
+Before performing any action:
+- Read ALL instructions on the right side — every numbered step, sub-step, command, script, config, test, and verification.
+- Identify which environment each step targets: Kali Linux, Windows, Browser, Network device, or other VM.
+- Note every exact value (IP addresses, ports, usernames, passwords, file paths, URLs, interface names, case-sensitive strings).
+- Create an internal checklist. Do not skip a step because the result looks obvious.
+
+### 2. Execute Instead of Explaining
+For every instruction that requires an action:
+  Open application → Navigate → Enter command → Execute → Wait → Observe output → Verify expected result → Continue.
+NEVER respond with "Run this command." — actually run it. Do NOT mark complete until you have seen the expected result on screen.
+
+### 3. Kali Linux Tasks
+1. Open the required terminal/application.
+2. Navigate to the correct directory.
+3. Execute every required command exactly.
+4. If a script is provided, run it exactly as required.
+5. Observe stdout/stderr and exit status.
+6. Check whether files were created or modified.
+7. Verify network connectivity, services, and processes when applicable.
+Verification commands (use only when appropriate):
+  echo $?  |  ls -la  |  pwd  |  ip addr  |  ip route  |  ps aux  |  ss -tulpn
+
+### 4. Windows Tasks
+1. Open the specified application.
+2. Navigate through the required interface.
+3. Enter commands into CMD or PowerShell when instructed.
+4. Execute scripts when required.
+5. Verify the resulting configuration or output.
+Verification commands (use only when appropriate):
+  ipconfig /all  |  Get-Service  |  Get-Process  |  Get-ChildItem  |  Get-Location
+
+### 5. Scripts
+1. Locate the script.
+2. Understand its intent.
+3. Check the current directory.
+4. Execute it using the method specified by the lab.
+5. Wait for completion.
+6. Check exit status, inspect output, verify changes.
+7. If execution fails: diagnose → fix → re-run → verify.
+Never assume a script succeeded because no obvious error appeared.
+
+### 6. Every Command: Execute → Observe → Verify → Continue
+If a command returns an error:
+1. Read the error.
+2. Identify the cause: wrong directory, wrong syntax, missing package, service not running, network config, permission, wrong target, previous step not done.
+3. Fix the issue.
+4. Re-execute the original command.
+5. Verify the expected result.
+Do NOT repeat a failing command without diagnosing why it failed.
+
+### 7. GUI Instructions
+- Click the exact element specified.
+- Enter the required values exactly.
+- Save/apply the configuration.
+- Confirm the setting was actually applied.
+Pay attention to: IP addresses, hostnames, ports, usernames, file paths, URLs, interface names, service names, config values, case sensitivity.
+
+### 8. Do Not Skip "Small" Steps
+These must NEVER be skipped: cd, mkdir, file creation, file editing, file saving, starting/stopping services, setting permissions, running scripts, running scans, checking results, opening applications, selecting targets, applying configurations, confirming dialogs.
+
+### 9. Checklist Discipline
+A step only gets [✓] when its result has been visually verified in a screenshot.
+[✓] = verified  |  [ ] = not complete
+
+### 10. Handle Errors Properly
+FAILED → Read error → Identify cause → Check environment → Correct issue → Re-run → Verify → Continue.
+Do not abandon steps on first failure.
+
+### 11. Avoid Unnecessary Changes
+Only make changes required by the instructions or necessary to resolve an error in the lab.
+
+### 12. Security Lab Restrictions
+Perform security commands ONLY against targets explicitly provided by the MindTap exercise. Do NOT extend scans, attacks, or exploitation to systems outside the assigned lab environment.
+
+### 13. Verification Before Submission
+Before completing: check every command, script, configuration, required file, scan, value, output, and question against the full instructions list.
+
+### 14. Do Not Submit Prematurely
+NEVER mark complete just because the main task appears to work. Ask internally: "Have I completed every instruction including sub-steps and verification?"
+
+### 15. Final State
+Only mark COMPLETE when: all instructions performed, commands executed, scripts executed, configurations applied, results verified, errors resolved, and the instruction list double-checked.
+`;
+
   // ─── Phase 0 Prompt: Read the Entire Task First ──────────────────────────────
   function buildReadTaskPrompt(allInstructions, labContext) {
     return `You are an automation agent for Cengage MindTap virtual cybersecurity labs (${labContext}).
-
+${AGENT_PERSONA}
 ## PHASE 0 — READ THE ENTIRE TASK FIRST
-
-Before performing any action you must:
-1. Read the complete task/instructions below.
-2. Identify every numbered step, sub-step, command, script, configuration, test, and verification requirement.
-3. Determine which environment each step targets: Kali Linux, Windows, Browser, Network device, or other VM.
-4. Create a numbered checklist of every required action.
-5. Identify any scripts that need to be located and run.
-6. Note every value that must be entered exactly (IP addresses, ports, usernames, file paths, URLs, passwords).
 
 Full lab instructions:
 """
@@ -403,47 +484,15 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
   // ─── Per-Step Agent Prompt ───────────────────────────────────────────────────
   function buildStepPrompt(stepText, labContext, checklist, previousErrorReason) {
     const errorSection = previousErrorReason
-      ? `\n## Previous Attempt Failed\nError reason from last iteration: "${previousErrorReason}"\nYou must diagnose why that failed and take a different action to resolve it.\n`
+      ? `\n## Previous Attempt Failed\nError reason from last iteration: "${previousErrorReason}"\nYou must diagnose why that failed and take a DIFFERENT action to resolve it before retrying.\n`
       : "";
 
     const checklistText = checklist.length > 0
       ? checklist.join("\n")
       : "(No checklist yet — this may be the first step)";
 
-    return `You are an automation agent for Cengage MindTap virtual cybersecurity labs.
-
-Your primary goal is to COMPLETE the assigned virtual lab as fully as possible before submission.
-Do NOT explain what the student should do — actually PERFORM the required actions.
-
-## The Persona You Must Follow
-
-### Execute Instead of Explaining
-For every instruction: Open the application → Navigate → Enter commands → Execute → Wait → Observe output → Verify → Continue.
-NEVER type a command without following up with Enter and then checking the result in the next iteration.
-
-### Verification
-After running a command, the NEXT screenshot will show the output. Read stdout/stderr carefully.
-- Check exit status patterns: prompt reappearing = success, error messages = failure.
-- Use these verification commands when appropriate (Kali): echo $?, ls -la, ip addr, ps aux, ss -tulpn
-- Use these verification commands when appropriate (Windows/PS): ipconfig /all, Get-Service, Get-Process, Get-ChildItem
-
-### Handle Errors Properly
-If a command fails:
-1. Read the error carefully.
-2. Identify the cause: wrong directory, wrong syntax, missing package, permission, service not running.
-3. Fix the issue.
-4. Re-run the original command.
-5. Verify the result.
-Do NOT repeat a failing command without first diagnosing why it failed.
-
-### Do Not Skip Small Steps
-Every step matters: cd commands, mkdir, chmod, service starts/stops, saving files, confirming dialogs.
-
-### Maintain Completion Checklist
-A step only gets [✓] when you have SEEN the expected result in a screenshot.
-
-### Do Not Mark Complete Prematurely
-Only set status "complete" when you have visually verified the expected outcome on screen.
+    return `You are an automation agent for Cengage MindTap virtual cybersecurity labs (${labContext}).
+${AGENT_PERSONA}
 ${errorSection}
 ---
 
@@ -461,16 +510,16 @@ A screenshot of the current VM state is attached. Analyze it carefully before de
 
 ## Available Actions
 - {"type":"focus_vm"} — focus the VM window before typing (always first)
-- {"type":"type_text","value":"text"} - type text into VM via native keystrokes (use \n for newline/Enter within text)
-- {"type":"paste_text","value":"multi-line text"} - clipboard paste into VM via Ctrl+V (BEST for long commands or scripts with special chars)
+- {"type":"type_text","value":"text"} — type text via native keystrokes (use \\n for Enter within text)
+- {"type":"paste_text","value":"multi-line text"} — clipboard paste via Ctrl+V (best for long commands or scripts with special chars)
 - {"type":"key","value":"Enter"} — single key: Enter, Tab, Escape, Space, Backspace, Delete, F1-F12, ArrowUp/Down/Left/Right, Home, End
 - {"type":"shortcut","value":"ctrl+c"} — keyboard shortcut
 - {"type":"win_run","value":"cmd.exe","waitAfter":3000} — Win+R run dialog
 - {"type":"wait","value":2000} — wait N ms (always add after win_run and slow operations)
-- {"type":"click","selector":".css-selector"} - click a DOM element in the Cengage instructions panel (NOT the VM canvas)
-- {"type":"scroll","direction":"down","amount":300} - scroll the instructions panel up or down
+- {"type":"click","selector":".css-selector"} — click a DOM element in the Cengage instructions panel (NOT the VM canvas)
+- {"type":"scroll","direction":"down","amount":300} — scroll the instructions panel
 
-## Common Mappings (Windows)
+## Common Windows Shortcuts
 - Windows Defender Firewall → win_run "wf.msc"
 - Computer Management → win_run "compmgmt.msc"
 - Server Manager → win_run "ServerManager.exe"
@@ -482,12 +531,12 @@ A screenshot of the current VM state is attached. Analyze it carefully before de
 - Task Manager → shortcut "ctrl+shift+esc"
 - Login screen → shortcut "ctrl+alt+delete", then type password + Enter
 
-## Rules
+## Action Sequencing Rules
 - Always start actions with focus_vm
 - After win_run, always add wait 3000+
 - After app opens, add wait 2000 before interacting
-- After typing a command in terminal, always add {"type":"key","value":"Enter"} then {"type":"wait","value":2000}
-- After waiting, the NEXT iteration will screenshot and verify the result
+- After typing a command in terminal: always add {"type":"key","value":"Enter"} then {"type":"wait","value":2000}
+- After waiting, the NEXT iteration screenshots to verify the result
 
 Return ONLY a valid JSON object. Do NOT use markdown fences.
 {
@@ -506,18 +555,18 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
 Status values:
 - "in_progress" — still working, loop will re-screenshot and come back
-- "verify_only" — no new actions needed, just take a screenshot to see the result of previous actions
-- "complete" — step fully done AND verified by observing the expected output in the screenshot
-- "error" — encountered an unrecoverable error (explain in error_reason)`;
+- "verify_only" — no new actions needed, just screenshot to see result of previous actions
+- "complete" — step fully done AND verified by observing expected output in the screenshot
+- "error" — unrecoverable error (explain in error_reason)`;
   }
 
   // ─── Phase 3 Pre-Submission Review Prompt ──────────────────────────────────
   function buildPreSubmitPrompt(allInstructions, finalChecklist, labContext) {
     return `You are an automation agent completing a final pre-submission review of a Cengage MindTap cybersecurity lab (${labContext}).
-
+${AGENT_PERSONA}
 ## PHASE 3 — VERIFICATION BEFORE SUBMISSION
 
-Compare what was accomplished against EVERY instruction.
+Compare what was accomplished against EVERY instruction. Do NOT submit prematurely.
 
 Full lab instructions:
 """
@@ -529,7 +578,7 @@ ${finalChecklist.join("\n")}
 
 A screenshot of the current VM state is attached.
 
-Check:
+Check ALL of the following:
 - Every command executed and verified
 - Every script executed and verified
 - Every configuration completed
@@ -642,19 +691,51 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
         // scripts or long commands that are error-prone to type char-by-char.
         const pasteVal = String(action.value || "");
         sendStatus(`Paste via clipboard: "${pasteVal.slice(0, 60)}"`, "info");
+
+        // Attempt 1: modern Clipboard API (works when page has focus + permission)
+        let clipboardOk = false;
         try {
           await navigator.clipboard.writeText(pasteVal);
-        } catch (_) {
-          // Fallback: execCommand (deprecated but still works in extensions)
-          const ta = document.createElement("textarea");
-          ta.value = pasteVal;
-          document.body.appendChild(ta);
-          ta.select();
-          document.execCommand("copy");
-          document.body.removeChild(ta);
+          clipboardOk = true;
+        } catch (_) {}
+
+        // Attempt 2: execCommand via a temporary off-screen textarea
+        if (!clipboardOk) {
+          try {
+            const ta = document.createElement("textarea");
+            ta.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0";
+            ta.value = pasteVal;
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            clipboardOk = document.execCommand("copy");
+            document.body.removeChild(ta);
+          } catch (_) {}
         }
+
+        // Attempt 3: inject clipboard content via background service worker
+        // (background has no cross-origin restriction for clipboardWrite)
+        if (!clipboardOk) {
+          try {
+            await new Promise(resolve => {
+              chrome.runtime.sendMessage(
+                { type: "CLIPBOARD_WRITE", text: pasteVal },
+                () => resolve()
+              );
+            });
+            clipboardOk = true;
+          } catch (_) {}
+        }
+
+        if (!clipboardOk) {
+          // Ultimate fallback: type character by character
+          sendStatus("Clipboard unavailable — falling back to char-by-char typing", "warn");
+          await typeTextNatively(pasteVal);
+          break;
+        }
+
         focusVM();
-        await delay(200);
+        await delay(300);
         await sendNativeKey("v", 2); // Ctrl+V
         await delay(currentSpeed * 0.3);
         break;
@@ -1164,11 +1245,20 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
 
     if (msg.type === "VM_ACTION") {
       // Execute keystrokes in frames that have the VM canvas.
-      // The master (instructions) frame does NOT execute VM actions.
+      // If the master frame itself also contains the canvas (some LOD layouts merge
+      // instructions + VM into one frame), allow it to execute actions too.
       const hasCanvas = !!getVMCanvas();
       const isCanvasFrame = hasCanvas || !!document.querySelector("canvas");
       if (isCanvasFrame && !IS_MASTER_FRAME) {
+        // Sub-frame with canvas: execute and ACK
         executeActionsLocally(msg.actions);
+        sendResponse({ executed: true, frame: "sub" });
+      } else if (isCanvasFrame && IS_MASTER_FRAME) {
+        // Master frame also has the canvas (single-frame LOD layout)
+        executeActionsLocally(msg.actions);
+        sendResponse({ executed: true, frame: "master-canvas" });
+      } else {
+        sendResponse({ executed: false });
       }
     }
 
