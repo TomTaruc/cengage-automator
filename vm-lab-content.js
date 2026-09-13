@@ -205,14 +205,14 @@
       try {
         const el = document.querySelector(sel);
         if (el && el.innerText?.trim().length > 50) {
-          // Don't truncate here — we want all of it
-          return cleanStepText(el.innerText.trim()).slice(0, 4000);
+          // Use up to 8000 chars so multi-section labs are fully captured
+          return cleanStepText(el.innerText.trim()).slice(0, 8000);
         }
       } catch (_) {}
     }
     // Fallback to body
     const body = document.body.innerText?.trim() || "";
-    return cleanStepText(body).slice(0, 4000);
+    return cleanStepText(body).slice(0, 8000);
   }
 
   function getCurrentStepText() {
@@ -261,7 +261,12 @@
     await delay(200);
     for (const char of text) {
       if (stopRequested) break;
-      await sendNativeKey(char, 0, char);
+      if (char === "\n" || char === "\r") {
+        // Newline → send Enter key (char event alone won't trigger VM input)
+        await sendNativeKey("Enter", 0, "");
+      } else {
+        await sendNativeKey(char, 0, char);
+      }
       await delay(15); // 15ms per char (was 30ms)
     }
     return true;
@@ -400,11 +405,14 @@ A screenshot of the current VM state is attached. Analyze it carefully before de
 
 ## Available Actions
 - {"type":"focus_vm"} — focus the VM window before typing (always first)
-- {"type":"type_text","value":"text"} — type text into VM via native keystrokes
+- {"type":"type_text","value":"text"} - type text into VM via native keystrokes (use \n for newline/Enter within text)
+- {"type":"paste_text","value":"multi-line text"} - clipboard paste into VM via Ctrl+V (BEST for long commands or scripts with special chars)
 - {"type":"key","value":"Enter"} — single key: Enter, Tab, Escape, Space, Backspace, Delete, F1-F12, ArrowUp/Down/Left/Right, Home, End
 - {"type":"shortcut","value":"ctrl+c"} — keyboard shortcut
 - {"type":"win_run","value":"cmd.exe","waitAfter":3000} — Win+R run dialog
 - {"type":"wait","value":2000} — wait N ms (always add after win_run and slow operations)
+- {"type":"click","selector":".css-selector"} - click a DOM element in the Cengage instructions panel (NOT the VM canvas)
+- {"type":"scroll","direction":"down","amount":300} - scroll the instructions panel up or down
 
 ## Common Mappings (Windows)
 - Windows Defender Firewall → win_run "wf.msc"
@@ -538,6 +546,64 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
         await delay(Number(action.value) || 1000);
         break;
 
+      case "click": {
+        // Click a DOM element in the instructions panel (not the VM)
+        // action.selector: CSS selector string
+        const sel = String(action.selector || action.value || "");
+        if (!sel) { sendStatus("click action missing selector", "warn"); break; }
+        try {
+          const el = document.querySelector(sel);
+          if (el && isVisible(el)) {
+            sendStatus(`Clicking: ${sel}`, "info");
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            await delay(200);
+            el.click();
+            await delay(500);
+          } else {
+            sendStatus(`Click target not found or hidden: ${sel}`, "warn");
+          }
+        } catch (e) {
+          sendStatus(`Click error: ${e.message}`, "warn");
+        }
+        break;
+      }
+
+      case "scroll": {
+        // Scroll the instructions panel
+        // action.direction: "up" | "down" (default "down"), action.amount: px (default 300)
+        const dir = String(action.direction || "down");
+        const amt = Number(action.amount || 300);
+        const panel = findFirst(STEP_TEXT_SELECTORS);
+        const target = panel || document.documentElement;
+        target.scrollBy({ top: dir === "up" ? -amt : amt, behavior: "smooth" });
+        sendStatus(`Scrolled panel ${dir} ${amt}px`, "info");
+        await delay(400);
+        break;
+      }
+
+      case "paste_text": {
+        // Write text to clipboard then Ctrl+V in the VM — useful for multi-line
+        // scripts or long commands that are error-prone to type char-by-char.
+        const pasteVal = String(action.value || "");
+        sendStatus(`Paste via clipboard: "${pasteVal.slice(0, 60)}"`, "info");
+        try {
+          await navigator.clipboard.writeText(pasteVal);
+        } catch (_) {
+          // Fallback: execCommand (deprecated but still works in extensions)
+          const ta = document.createElement("textarea");
+          ta.value = pasteVal;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+        }
+        focusVM();
+        await delay(200);
+        await sendNativeKey("v", 2); // Ctrl+V
+        await delay(currentSpeed * 0.3);
+        break;
+      }
+
       default:
         sendStatus(`Unknown action: ${action.type}`, "warn");
     }
@@ -564,6 +630,9 @@ Return ONLY a valid JSON object. Do NOT use markdown fences.
       if (a.type === "wait") return acc + Number(a.value || 1000);
       if (a.type === "win_run") return acc + 1000 + Number(a.waitAfter || 2500);
       if (a.type === "type_text") return acc + (String(a.value || "").length * 18) + 300;
+      if (a.type === "paste_text") return acc + 800; // clipboard write + paste
+      if (a.type === "click") return acc + 700;
+      if (a.type === "scroll") return acc + 400;
       return acc + 200; // focus_vm, key, shortcut
     }, 0);
   }
