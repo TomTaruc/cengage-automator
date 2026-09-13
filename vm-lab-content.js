@@ -26,27 +26,36 @@
   // ─── Frame Guard ────────────────────────────────────────────────────────────
   // Cross-origin iframes each see window.self === window.top as TRUE, so the old
   // IS_TOP_FRAME check fails on LOD pages (instructions + VM are separate origins).
-  // We use chrome.storage.session as a distributed mutex: the first frame to
+  // We use chrome.storage.local as a distributed mutex: the first frame to
   // acquire the "vmMasterFrame" key becomes the master and runs the control loop.
   // All other frames only execute VM_ACTION messages (keystrokes/clicks in the VM).
   let IS_MASTER_FRAME = false; // set async via tryAcquireMasterLock()
 
   function tryAcquireMasterLock() {
     return new Promise(resolve => {
+      if (!chrome.storage || !chrome.storage.local) {
+        resolve(false);
+        return;
+      }
       const myToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       // Write our token, then read back after a short race window
-      chrome.storage.session.set({ vmMasterFrame: myToken }, () => {
+      chrome.storage.local.set({ vmMasterFrame: myToken }, () => {
         setTimeout(() => {
-          chrome.storage.session.get(["vmMasterFrame"], ({ vmMasterFrame }) => {
+          chrome.storage.local.get(["vmMasterFrame"], ({ vmMasterFrame }) => {
             resolve(vmMasterFrame === myToken);
           });
         }, 80 + Math.random() * 120); // 80-200ms race window
       });
+    }).catch(e => {
+      console.error("[VM-Automator] Lock error:", e);
+      return false;
     });
   }
 
   function releaseMasterLock() {
-    chrome.storage.session.remove("vmMasterFrame");
+    if (chrome.storage && chrome.storage.local) {
+      chrome.storage.local.remove("vmMasterFrame");
+    }
   }
 
   // ─── State ─────────────────────────────────────────────────────────────────
