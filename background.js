@@ -66,38 +66,61 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
-  // ── POPUP_BROADCAST — send to all registered frames in a tab ─────────────
+  // ── POPUP_BROADCAST — inject if needed, then send to all frames ──────────
   if (msg.type === "POPUP_BROADCAST") {
     const { tabId, payload } = msg;
     if (!tabId || !payload) { sendResponse({ error: "missing tabId or payload" }); return false; }
 
-    const frames = frameRegistry.get(tabId);
-    if (!frames || frames.size === 0) {
-      // No registered frames — fall back to broadcast (may only hit top frame)
-      chrome.tabs.sendMessage(tabId, payload, (resp) => {
-        if (chrome.runtime.lastError || !resp) {
-          sendResponse({ error: "no registered frames and broadcast failed" });
-        } else {
-          sendResponse(resp);
+    (async () => {
+      // Step 1: Try registered frames first (fastest path after a clean page load)
+      const frames = frameRegistry.get(tabId);
+      if (frames && frames.size > 0) {
+        for (const [frameId] of frames) {
+          try {
+            const resp = await new Promise((res, rej) => {
+              chrome.tabs.sendMessage(tabId, payload, { frameId }, (r) => {
+                if (chrome.runtime.lastError) rej(chrome.runtime.lastError);
+                else res(r);
+              });
+            });
+            if (resp) { sendResponse(resp); return; }
+          } catch (_) {}
         }
-      });
-      return true;
-    }
+      }
 
-    // Send to ALL registered frames, resolve with first successful response
-    let resolved = false;
-    let pending = frames.size;
-    for (const [frameId] of frames) {
-      chrome.tabs.sendMessage(tabId, payload, { frameId }, (resp) => {
-        pending--;
-        if (!resolved && !chrome.runtime.lastError && resp) {
-          resolved = true;
-          sendResponse(resp);
-        } else if (!resolved && pending === 0) {
-          sendResponse({ error: "all registered frames failed to respond" });
+      // Step 2: Inject content script into ALL frames from the background
+      // (background scripting can reach cross-origin frames that popup cannot)
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId, allFrames: true },
+          files: ["vm-lab-content.js"]
+        });
+        await new Promise(r => setTimeout(r, 1500));
+      } catch (_) {
+        // Some frames may already have the script — ignore errors
+      }
+
+      // Step 3: Use webNavigation to enumerate all frames and message each
+      try {
+        const allFrames = await chrome.webNavigation.getAllFrames({ tabId });
+        let sent = false;
+        for (const frame of (allFrames || [])) {
+          if (sent) break;
+          try {
+            const resp = await new Promise((res, rej) => {
+              chrome.tabs.sendMessage(tabId, payload, { frameId: frame.frameId }, (r) => {
+                if (chrome.runtime.lastError) rej(chrome.runtime.lastError.message);
+                else res(r);
+              });
+            });
+            if (resp) { sent = true; sendResponse(resp); }
+          } catch (_) {}
         }
-      });
-    }
+        if (!sent) sendResponse({ error: "no frame responded after injection" });
+      } catch (e) {
+        sendResponse({ error: String(e) });
+      }
+    })();
     return true;
   }
 
